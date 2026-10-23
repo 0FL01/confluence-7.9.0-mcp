@@ -310,11 +310,20 @@ func (c *ConfluenceClient) getImage(ctx context.Context, attachmentID string) ([
 	}
 }
 
-// getInlineComments returns the flat inline/resolved comment list, including replies.
-func (c *ConfluenceClient) getInlineComments(ctx context.Context, contentID string) ([]json.RawMessage, error) {
+// getComments returns all comments at a location, including replies and REST pages.
+func (c *ConfluenceClient) getComments(ctx context.Context, contentID, location string) ([]json.RawMessage, error) {
 	const pageSize = 100
 	var comments []json.RawMessage
 	start := 0
+	query := url.Values{
+		"location": {location},
+		"depth":    {"all"},
+		"limit":    {fmt.Sprintf("%d", pageSize)},
+	}
+	if location == "inline" {
+		query.Add("location", "resolved")
+		query.Set("expand", "body.storage,history,version,extensions.inlineProperties,extensions.resolution")
+	}
 	for {
 		var page struct {
 			Results []json.RawMessage `json:"results"`
@@ -322,13 +331,7 @@ func (c *ConfluenceClient) getInlineComments(ctx context.Context, contentID stri
 				Next string `json:"next"`
 			} `json:"_links"`
 		}
-		query := url.Values{
-			"location": {"inline", "resolved"},
-			"depth":    {"all"},
-			"expand":   {"body.storage,history,version,extensions.inlineProperties,extensions.resolution"},
-			"limit":    {fmt.Sprintf("%d", pageSize)},
-			"start":    {fmt.Sprintf("%d", start)},
-		}
+		query.Set("start", fmt.Sprintf("%d", start))
 		if err := c.getJSON(ctx, "/content/"+contentID+"/child/comment", query, &page); err != nil {
 			return nil, err
 		}
@@ -391,13 +394,20 @@ func inlineCommentsData(comments []json.RawMessage, mode string) (map[string]any
 			line, _, _ := strings.Cut(comment.Body.Storage.Value, "\n")
 			preview := []rune(line)
 			if len(preview) > 240 {
-				line = string(preview[:240]) + "…"
+				line = string(preview[:240])
+				// Keep complete markup tokens; the preview is still an XHTML fragment.
+				if open := strings.LastIndexByte(line, '<'); open > strings.LastIndexByte(line, '>') {
+					line = line[:open]
+				}
+				if amp := strings.LastIndexByte(line, '&'); amp > strings.LastIndexByte(line, ';') {
+					line = line[:amp]
+				}
+				line += "…"
 			}
-			item = map[string]any{
+			summary := map[string]any{
 				"id":                comment.ID,
 				"originalSelection": comment.Extensions.InlineProperties.OriginalSelection,
 				"markerRef":         comment.Extensions.InlineProperties.MarkerRef,
-				"status":            comment.Extensions.Resolution.Status,
 				"author":            comment.History.CreatedBy.DisplayName,
 				"createdDate":       comment.History.CreatedDate,
 				"version":           comment.Version.Number,
@@ -405,6 +415,10 @@ func inlineCommentsData(comments []json.RawMessage, mode string) (map[string]any
 				"updatedDate":       comment.Version.When,
 				"bodyPreview":       line,
 			}
+			if comment.Extensions.InlineProperties.OriginalSelection != "" {
+				summary["status"] = comment.Extensions.Resolution.Status
+			}
+			item = summary
 		}
 		if comment.Extensions.InlineProperties.OriginalSelection != "" {
 			threads = append(threads, thread{Root: item, Replies: make([]any, 0)})
@@ -578,9 +592,6 @@ func handleGetContent(client *ConfluenceClient) func(context.Context, mcp.CallTo
 			return mcp.NewToolResultError(fmt.Sprintf("error getting content: %v", err)), nil
 		}
 
-		if mode == "none" {
-			return mcp.NewToolResultText(string(resp)), nil
-		}
 		var content struct {
 			Type string `json:"type"`
 		}
@@ -591,16 +602,28 @@ func handleGetContent(client *ConfluenceClient) func(context.Context, mcp.CallTo
 			return mcp.NewToolResultText(string(resp)), nil
 		}
 
-		comments, err := client.getInlineComments(ctx, contentID)
-		var discussion map[string]any
-		if err == nil {
-			discussion, err = inlineCommentsData(comments, mode)
-		}
-		if err != nil {
-			discussion = map[string]any{
-				"mode":                   mode,
-				"footerCommentsIncluded": false,
-				"warning":                fmt.Sprintf("Inline comments unavailable: %v", err),
+		discussion := map[string]any{"mode": mode, "footerCommentsIncluded": false}
+		if mode != "none" {
+			comments, err := client.getComments(ctx, contentID, "inline")
+			if err == nil {
+				discussion, err = inlineCommentsData(comments, mode)
+			}
+			if err != nil {
+				discussion = map[string]any{
+					"mode":                   mode,
+					"footerCommentsIncluded": false,
+					"warning":                fmt.Sprintf("Inline comments unavailable: %v", err),
+				}
+			}
+			footer, err := client.getComments(ctx, contentID, "footer")
+			if err != nil {
+				warning := fmt.Sprintf("Footer comment count unavailable: %v", err)
+				if previous, ok := discussion["warning"].(string); ok {
+					warning = previous + "; " + warning
+				}
+				discussion["warning"] = warning
+			} else {
+				discussion["footerComments"] = len(footer)
 			}
 		}
 		// Preserve native content fields while returning one parseable JSON object.
@@ -888,10 +911,10 @@ func setupServer(client *ConfluenceClient) *mcpserver.MCPServer {
 	)
 
 	s.AddTool(mcp.NewTool("confluence_get_content",
-		mcp.WithDescription("Get content by ID from Confluence 7.9.0 Server (selfhosted). One JSON object; pages/blogposts include inlineComments (resolved included, footer excluded). Read this discussion context before relying on the body; check warning if unavailable. Default summary has bounded previews; use full for complete comments or none to skip. Threads use originalSelection and response order, not explicit parent IDs."),
+		mcp.WithDescription("Get content by ID from Confluence 7.9.0 Server (selfhosted). One JSON object; pages/blogposts include inlineComments (resolved included, footer excluded but counted). Read this discussion context before relying on the body; check warning if unavailable. Default summary has bounded XHTML previews and status only on roots; use full for complete comments or none to skip requests with an explicit mode marker. Threads use originalSelection and response order, not explicit parent IDs."),
 		mcp.WithString("contentId", mcp.Required(), mcp.Description("Confluence content ID")),
 		mcp.WithString("expand", mcp.Description("Comma-separated list of properties to expand")),
-		mcp.WithString("inlineComments", mcp.Enum("none", "summary", "full"), mcp.DefaultString("summary"), mcp.Description("Inline/resolved discussion: summary (default), full (raw comments grouped into root/replies), or none (no comment requests). Footer comments are excluded.")),
+		mcp.WithString("inlineComments", mcp.Enum("none", "summary", "full"), mcp.DefaultString("summary"), mcp.Description("Inline/resolved discussion: summary (default, status on roots only), full (raw comments grouped into root/replies), or none (no comment requests; returns mode:none). Footer comments are excluded; summary/full report their count as footerComments.")),
 	), handleGetContent(client))
 
 	s.AddTool(mcp.NewTool("confluence_get_image",

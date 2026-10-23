@@ -219,7 +219,7 @@ Retrieve content with `GET /content/{contentId}` relative to the configured REST
 
 `body.storage` is always included in the expansions, together with any caller-supplied expansions. This request has no pagination parameters.
 
-For `page` and `blogpost` content (unless `inlineComments: "none"`), the tool fetches comments with `GET /content/{contentId}/child/comment?location=inline&location=resolved&depth=all&expand=body.storage,history,version,extensions.inlineProperties,extensions.resolution&limit=100&start=N`, following pagination until `_links.next` is absent. Resolved threads and replies are included; **footer comments are not included**, explicitly indicated by `footerCommentsIncluded: false`. This is not all page discussion. `summary` reduces MCP output, not the REST data fetched.
+For `page` and `blogpost` content (unless `inlineComments: "none"`), the tool fetches comments with `GET /content/{contentId}/child/comment?location=inline&location=resolved&depth=all&expand=body.storage,history,version,extensions.inlineProperties,extensions.resolution&limit=100&start=N`, following pagination until `_links.next` is absent. Resolved threads and replies are included; **footer comments are not included**, explicitly indicated by `footerCommentsIncluded: false`. A separate `location=footer&depth=all&limit=100&start=N` query, without expansions and with the same pagination, counts the excluded footer comments and replies in `footerComments`. This is not all page discussion. `summary` reduces MCP output, not the REST data fetched.
 
 The single JSON result retains the native page fields (`id`, `body`, etc.) and adds an `inlineComments` object:
 
@@ -227,6 +227,7 @@ The single JSON result retains the native page fields (`id`, `body`, etc.) and a
 {
   "mode": "summary",
   "footerCommentsIncluded": false,
+  "footerComments": 6,
   "grouping": "originalSelection-and-response-order (heuristic)",
   "counts": {"threads": 2, "comments": 3},
   "threads": [
@@ -238,15 +239,15 @@ The single JSON result retains the native page fields (`id`, `body`, etc.) and a
 
 The example abbreviates comment fields. Read this discussion context before relying on the page body:
 
-- `summary`: every root and reply includes `id`, `originalSelection`, `markerRef`, `status`, `author`, `createdDate`, `version`, `updatedBy`, `updatedDate`, and `bodyPreview`. The preview is the first line of storage XHTML, capped at 240 Unicode characters plus an ellipsis; it is not the complete comment. Use `full` when the preview is insufficient.
-- `full`: `root` and `replies` retain the complete REST comment objects, including `extensions.inlineProperties`, `extensions.resolution`, `history`, `version` (latest edit), and `body.storage.value`.
-- `none`: no automatic comment requests or added field; the raw content response is returned unchanged. Reading a comment or attachment by ID also skips comment loading.
+- `summary`: every root and reply includes `id`, `originalSelection`, `markerRef`, `author`, `createdDate`, `version`, `updatedBy`, `updatedDate`, and `bodyPreview`. Only roots include `status`, which describes the thread; replies omit it because their REST resolution can remain `open` even in a resolved thread. The preview is the first line of storage XHTML, capped at 240 Unicode characters plus an ellipsis, backing up if that limit splits a tag or entity. It remains an XHTML fragment, not a complete or necessarily balanced comment. Use `full` when the preview is insufficient.
+- `full`: `root` and `replies` retain the complete REST comment objects, including `extensions.inlineProperties`, `extensions.resolution`, `history`, `version` (latest edit), and `body.storage.value`. Read the thread's resolution from the root, not replies.
+- `none`: no automatic comment requests, including footer counting. Pages/blogposts still include `inlineComments: {"mode":"none","footerCommentsIncluded":false}`, with no counts or threads, explicitly indicating that discussion was not requested. Reading a comment or attachment by ID skips comment loading and returns the raw content response unchanged.
 
 Confluence's `depth=all` response is flat, not nested under `children.comment.results`. After collecting all REST pages, the tool starts a thread at each nonempty `extensions.inlineProperties.originalSelection` and attaches subsequent quote-less replies to it, including across pagination boundaries. This follows observed Server 7.9.0 ordering, **not a documented parent-ID guarantee**; a changed ordering could misattribute replies. A reply before any root produces a warning rather than a fabricated relationship. No per-root requests are made.
 
 `originalSelection` is the quote at creation time, not a unique/current anchor. Keep `markerRef` when relating a discussion to the body; markers may be missing after edits or occur multiple times. Neither field guarantees an unambiguous current location. `history` records creation; `version` supplies the latest edit metadata, not the complete edit history.
 
-With no comments, `counts` are both zero and `threads` is empty. If comment fetching or grouping fails, the page still succeeds, with `inlineComments.warning` and without `counts`/`threads`; this means discussion is unavailable, **not absent**.
+With no inline/resolved comments, `counts` are both zero and `threads` is empty. If inline comment fetching or grouping fails, the page still succeeds, with `inlineComments.warning` and without `counts`/`threads`; this means discussion is unavailable, **not absent**. If only footer counting fails, the page and inline discussion are retained, `warning` describes the footer failure, and `footerComments` is omitted rather than reported as zero.
 
 For insight across pages, the existing search tool can select comments directly: `{"cql":"type=comment AND container=245617220","limit":100,"expand":"content.extensions.inlineProperties,content.extensions.resolution"}`. Results are paginated, so advance `start` with `_links.next`.
 

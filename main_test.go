@@ -307,7 +307,7 @@ func TestHandleGetContentInlineComments(t *testing.T) {
 	const pageJSON = `{"id":"123","type":"page","title":"P","body":{"storage":{"value":"<p>P</p>","representation":"storage"}}}`
 	const openComment = `{"id":"9","type":"comment","extensions":{"location":"inline","inlineProperties":{"originalSelection":"horizontal","markerRef":"m1"},"resolution":{"status":"open"}},"history":{"createdBy":{"displayName":"Olga"},"createdDate":"2026-01-01T00:00:00Z"},"version":{"number":2,"by":{"displayName":"Editor"},"when":"2026-02-01T00:00:00Z"},"body":{"storage":{"value":"<p>Use the scroll</p>\n<p>More detail</p>","representation":"storage"}}}`
 	const resolvedComment = `{"id":"10","type":"comment","extensions":{"location":"inline","inlineProperties":{"originalSelection":"centering","markerRef":"m2"},"resolution":{"status":"resolved"}},"body":{"storage":{"value":"<p>No centering</p>","representation":"storage"}}}`
-	reply := `{"id":"11","type":"comment","extensions":{"location":"inline","inlineProperties":{"originalSelection":"","markerRef":""}},"body":{"storage":{"value":"` + strings.Repeat("я", 300) + `","representation":"storage"}}}`
+	reply := `{"id":"11","type":"comment","extensions":{"location":"inline","inlineProperties":{"originalSelection":"","markerRef":""},"resolution":{"status":"open"}},"body":{"storage":{"value":"` + strings.Repeat("я", 300) + `","representation":"storage"}}}`
 	req := mcp.CallToolRequest{Params: mcp.CallToolParams{Arguments: map[string]any{"contentId": "123"}}}
 
 	newClient := func(t *testing.T, content, comments string, commentsStatus int) *ConfluenceClient {
@@ -317,6 +317,10 @@ func TestHandleGetContentInlineComments(t *testing.T) {
 			case strings.HasSuffix(r.URL.Path, "/child/comment"):
 				if comments == "" {
 					t.Error("unexpected comment request")
+				}
+				if r.URL.Query().Get("location") == "footer" {
+					_, _ = w.Write([]byte(`{"results":[]}`))
+					return
 				}
 				if commentsStatus != http.StatusOK {
 					w.WriteHeader(commentsStatus)
@@ -336,12 +340,26 @@ func TestHandleGetContentInlineComments(t *testing.T) {
 	for _, mode := range []string{"summary", "full"} {
 		t.Run("all threads across pages/"+mode, func(t *testing.T) {
 			var starts []string
+			var footerStarts []string
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path == "/rest/api/content/123" {
 					_, _ = w.Write([]byte(pageJSON))
 					return
 				}
 				query := r.URL.Query()
+				if query.Get("location") == "footer" {
+					want := url.Values{"location": {"footer"}, "depth": {"all"}, "limit": {"100"}, "start": {query.Get("start")}}
+					if !reflect.DeepEqual(query, want) {
+						t.Errorf("footer query %v, want %v", query, want)
+					}
+					footerStarts = append(footerStarts, query.Get("start"))
+					if query.Get("start") == "0" {
+						_, _ = w.Write([]byte(`{"results":[{},{}],"size":2,"_links":{"next":"/rest/api/content/123/child/comment?location=footer&start=2"}}`))
+					} else {
+						_, _ = w.Write([]byte(`{"results":[{},{},{},{}],"size":4}`))
+					}
+					return
+				}
 				want := url.Values{"location": {"inline", "resolved"}, "depth": {"all"}, "expand": {"body.storage,history,version,extensions.inlineProperties,extensions.resolution"}, "limit": {"100"}, "start": {query.Get("start")}}
 				if !reflect.DeepEqual(query, want) {
 					t.Errorf("comment query %v, want %v", query, want)
@@ -368,6 +386,7 @@ func TestHandleGetContentInlineComments(t *testing.T) {
 				InlineComments struct {
 					Mode                   string         `json:"mode"`
 					FooterCommentsIncluded bool           `json:"footerCommentsIncluded"`
+					FooterComments         int            `json:"footerComments"`
 					Grouping               string         `json:"grouping"`
 					Counts                 map[string]int `json:"counts"`
 					Threads                []struct {
@@ -381,7 +400,7 @@ func TestHandleGetContentInlineComments(t *testing.T) {
 				t.Fatalf("result is not one JSON object: %v", err)
 			}
 			discussion := got.InlineComments
-			if discussion.Mode != mode || discussion.FooterCommentsIncluded || discussion.Grouping == "" ||
+			if discussion.Mode != mode || discussion.FooterCommentsIncluded || discussion.FooterComments != 6 || discussion.Grouping == "" ||
 				!reflect.DeepEqual(discussion.Counts, map[string]int{"threads": 2, "comments": 3}) {
 				t.Errorf("discussion metadata: %+v", discussion)
 			}
@@ -398,7 +417,7 @@ func TestHandleGetContentInlineComments(t *testing.T) {
 					"updatedBy": "Editor", "updatedDate": "2026-02-01T00:00:00Z", "bodyPreview": "<p>Use the scroll</p>",
 				}
 				if !reflect.DeepEqual(discussion.Threads[0].Root, wantRoot) || discussion.Threads[1].Root["status"] != "resolved" ||
-					discussion.Threads[1].Replies[0]["bodyPreview"] != strings.Repeat("я", 240)+"…" {
+					discussion.Threads[1].Replies[0]["bodyPreview"] != strings.Repeat("я", 240)+"…" || discussion.Threads[1].Replies[0]["status"] != nil {
 					t.Errorf("summary fields or bounded preview: %+v", discussion.Threads)
 				}
 			} else {
@@ -426,6 +445,45 @@ func TestHandleGetContentInlineComments(t *testing.T) {
 			}
 			if !reflect.DeepEqual(starts, []string{"0", "2"}) {
 				t.Errorf("pagination starts: %v", starts)
+			}
+			if !reflect.DeepEqual(footerStarts, []string{"0", "2"}) {
+				t.Errorf("footer pagination starts: %v", footerStarts)
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name, suffix string
+	}{
+		{"preview cut inside a tag", `<ac:link><ri:user ri:userkey="user" /></ac:link>`},
+		{"preview cut inside an entity", `&quot;more text`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prefix := strings.Repeat("я", 238)
+			body, err := json.Marshal(prefix + tc.suffix)
+			if err != nil {
+				t.Fatal(err)
+			}
+			comment := `{"extensions":{"inlineProperties":{"originalSelection":"quote"}},"body":{"storage":{"value":` + string(body) + `}}}`
+			client := newClient(t, pageJSON, `{"results":[`+comment+`]}`, http.StatusOK)
+			result, err := handleGetContent(client)(ctx, req)
+			if err != nil || result.IsError || len(result.Content) != 1 {
+				t.Fatalf("expected page with preview: %v, %v", result, err)
+			}
+			var got struct {
+				InlineComments struct {
+					Threads []struct {
+						Root struct {
+							BodyPreview string `json:"bodyPreview"`
+						} `json:"root"`
+					} `json:"threads"`
+				} `json:"inlineComments"`
+			}
+			if err := json.Unmarshal([]byte(result.Content[0].(mcp.TextContent).Text), &got); err != nil {
+				t.Fatal(err)
+			}
+			if len(got.InlineComments.Threads) != 1 || got.InlineComments.Threads[0].Root.BodyPreview != prefix+"…" {
+				t.Errorf("preview contains a partial XHTML token: %+v", got)
 			}
 		})
 	}
@@ -478,10 +536,57 @@ func TestHandleGetContentInlineComments(t *testing.T) {
 		})
 	}
 
+	t.Run("footer count failure retains inline discussion", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.URL.Path == "/rest/api/content/123":
+				_, _ = w.Write([]byte(pageJSON))
+			case r.URL.Query().Get("location") == "footer":
+				w.WriteHeader(http.StatusForbidden)
+			default:
+				_, _ = w.Write([]byte(`{"results":[` + openComment + `]}`))
+			}
+		}))
+		defer server.Close()
+		client := NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL + "/rest/api", Login: "test-user", Password: "test-password"})
+		result, err := handleGetContent(client)(ctx, req)
+		if err != nil || result.IsError || len(result.Content) != 1 {
+			t.Fatalf("footer failure lost the page: %v, %v", result, err)
+		}
+		var got struct {
+			ConfluencePage
+			InlineComments map[string]any `json:"inlineComments"`
+		}
+		if err := json.Unmarshal([]byte(result.Content[0].(mcp.TextContent).Text), &got); err != nil {
+			t.Fatal(err)
+		}
+		warning, _ := got.InlineComments["warning"].(string)
+		if got.ID != "123" || got.Body.Storage.Value != "<p>P</p>" || !strings.Contains(warning, "Footer comment count unavailable:") || !strings.Contains(warning, "status 403") ||
+			got.InlineComments["footerComments"] != nil || !reflect.DeepEqual(got.InlineComments["counts"], map[string]any{"threads": float64(1), "comments": float64(1)}) || len(got.InlineComments["threads"].([]any)) != 1 {
+			t.Errorf("page/discussion/footer warning result: %+v", got)
+		}
+	})
+
 	t.Run("none skips comment requests", func(t *testing.T) {
 		client := newClient(t, pageJSON, "", http.StatusInternalServerError)
 		result, err := handleGetContent(client)(ctx, mcp.CallToolRequest{Params: mcp.CallToolParams{Arguments: map[string]any{"contentId": "123", "inlineComments": "none"}}})
-		assertToolText(t, result, err, pageJSON)
+		if err != nil || result.IsError || len(result.Content) != 1 {
+			t.Fatalf("expected page with none marker: %v, %v", result, err)
+		}
+		var got, want map[string]any
+		if err := json.Unmarshal([]byte(result.Content[0].(mcp.TextContent).Text), &got); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal([]byte(pageJSON), &want); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got["inlineComments"], map[string]any{"mode": "none", "footerCommentsIncluded": false}) {
+			t.Errorf("none marker: %v", got["inlineComments"])
+		}
+		delete(got, "inlineComments")
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("native page fields changed in none mode: %v", got)
+		}
 	})
 
 	t.Run("comment content is not expanded", func(t *testing.T) {
@@ -1904,6 +2009,15 @@ func TestHandleValidationBeforeHTTP(t *testing.T) {
 
 func TestHandleReadQueries(t *testing.T) {
 	content := `{"id":"123","type":"page","body":{"storage":{"value":"<p>C</p>","representation":"storage"}}}`
+	var contentFields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(content), &contentFields); err != nil {
+		t.Fatal(err)
+	}
+	contentFields["inlineComments"] = json.RawMessage(`{"footerCommentsIncluded":false,"mode":"none"}`)
+	contentWithNone, err := json.Marshal(contentFields)
+	if err != nil {
+		t.Fatal(err)
+	}
 	search := `{"results":[{"content":{"id":"123","type":"page","space":{"key":"TS"},"body":{"storage":{"value":"<p>C</p>","representation":"storage"}}}}],"start":0,"limit":25,"_links":{"next":"/rest/api/search?start=25"}}`
 	spaces := `{"results":[{"space":{"key":"TS","name":"Test","homepage":{"id":"123"}}}],"start":0,"limit":25,"_links":{"base":"http://example.test"}}`
 	for _, tc := range []struct {
@@ -1912,8 +2026,8 @@ func TestHandleReadQueries(t *testing.T) {
 		query                                url.Values
 		want                                 []string
 	}{
-		{"get expansion", "confluence_get_content", "/content/123", content, "", map[string]any{"contentId": "123", "expand": "version", "inlineComments": "none", "limit": 10.0, "start": 2.0}, url.Values{"expand": {"version,body.storage"}}, []string{content}},
-		{"get no duplicate", "confluence_get_content", "/content/123", content, "", map[string]any{"contentId": "123", "expand": "body.storage", "inlineComments": "none"}, url.Values{"expand": {"body.storage"}}, []string{content}},
+		{"get expansion", "confluence_get_content", "/content/123", content, "", map[string]any{"contentId": "123", "expand": "version", "inlineComments": "none", "limit": 10.0, "start": 2.0}, url.Values{"expand": {"version,body.storage"}}, []string{string(contentWithNone)}},
+		{"get no duplicate", "confluence_get_content", "/content/123", content, "", map[string]any{"contentId": "123", "expand": "body.storage", "inlineComments": "none"}, url.Values{"expand": {"body.storage"}}, []string{string(contentWithNone)}},
 		{"search", "confluence_search_content", "/search", search, "", map[string]any{"cql": `title ~ "a\\b"`, "expand": "content.body.storage,content.space"}, url.Values{"cql": {`title ~ "a\\b"`}, "limit": {"25"}, "expand": {"content.body.storage,content.space"}}, []string{search}},
 		{"spaces default", "confluence_list_spaces", "/search", spaces, "", map[string]any{}, url.Values{"cql": {"type=space"}, "limit": {"25"}}, []string{spaces}},
 		{"space title", "confluence_list_spaces", "/search", spaces, "", map[string]any{"searchText": `a\"quoted"*`, "limit": 0.0, "start": 2.0, "expand": "space.homepage"}, url.Values{"cql": {`type=space AND title ~ "a\\\"quoted\"*"`}, "limit": {"0"}, "start": {"2"}, "expand": {"space.homepage"}}, []string{spaces}},
