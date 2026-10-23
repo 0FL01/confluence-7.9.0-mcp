@@ -1113,6 +1113,19 @@ func TestHandleSearchContentErrors(t *testing.T) {
 			t.Error("expected error for missing cql")
 		}
 	})
+
+	t.Run("compact invalid JSON", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte(`not JSON`))
+		}))
+		defer server.Close()
+		client := NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL + "/rest/api", Login: "test-user", Password: "test-password"})
+		result, err := handleSearchContent(client)(ctx, mcp.CallToolRequest{Params: mcp.CallToolParams{Arguments: map[string]any{"cql": "type=page", "compact": true}}})
+		assertToolError(t, result, err)
+		if !strings.Contains(result.Content[0].(mcp.TextContent).Text, "error decoding search results") {
+			t.Fatalf("unexpected error: %v", result.Content)
+		}
+	})
 }
 
 // TestHandleCreateContentErrors tests error handling in create.
@@ -1664,7 +1677,7 @@ func TestSetupServer(t *testing.T) {
 	expected := map[string][]string{
 		"confluence_get_content":    {"contentId", "expand", "inlineComments"},
 		"confluence_get_image":      {"attachmentId", "downloadDir"},
-		"confluence_search_content": {"cql", "limit", "start", "expand"},
+		"confluence_search_content": {"cql", "limit", "start", "expand", "compact"},
 		"confluence_create_content": {"title", "spaceKey", "content", "type", "parentId"},
 		"confluence_update_content": {"contentId", "version", "title", "content", "versionComment"},
 		"confluence_list_spaces":    {"searchText", "limit", "start", "expand"},
@@ -1718,6 +1731,10 @@ func TestSetupServer(t *testing.T) {
 	commentsProperty := tools["confluence_get_content"].Tool.InputSchema.Properties["inlineComments"].(map[string]any)
 	if commentsProperty["type"] != "string" || commentsProperty["default"] != "summary" || !reflect.DeepEqual(commentsProperty["enum"], []string{"none", "summary", "full"}) {
 		t.Errorf("inlineComments schema: %v", commentsProperty)
+	}
+	compactProperty := tools["confluence_search_content"].Tool.InputSchema.Properties["compact"].(map[string]any)
+	if compactProperty["type"] != "boolean" || compactProperty["default"] != false {
+		t.Errorf("compact schema: %v", compactProperty)
 	}
 	response := s.HandleMessage(context.Background(), json.RawMessage(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}`))
 	rpc, ok := response.(mcp.JSONRPCResponse)
@@ -1967,6 +1984,8 @@ func TestHandleValidationBeforeHTTP(t *testing.T) {
 		result, err := handleGetContent(client)(context.Background(), mcp.CallToolRequest{Params: mcp.CallToolParams{Arguments: map[string]any{"contentId": "123", "inlineComments": mode}}})
 		assertToolError(t, result, err)
 	}
+	result, err := handleSearchContent(client)(context.Background(), mcp.CallToolRequest{Params: mcp.CallToolParams{Arguments: map[string]any{"cql": "type=page", "compact": "true"}}})
+	assertToolError(t, result, err)
 	for _, args := range []map[string]any{
 		{}, {"attachmentId": ""}, {"attachmentId": 123.0}, {"attachmentId": "123/456"}, {"attachmentId": "..123"},
 		{"attachmentId": "123", "downloadDir": 123.0},
@@ -1975,7 +1994,7 @@ func TestHandleValidationBeforeHTTP(t *testing.T) {
 		result, err := handleGetImage(client)(context.Background(), mcp.CallToolRequest{Params: mcp.CallToolParams{Arguments: args}})
 		assertToolError(t, result, err)
 	}
-	result, err := handleGetImage(client)(context.Background(), mcp.CallToolRequest{Params: mcp.CallToolParams{Arguments: "invalid"}})
+	result, err = handleGetImage(client)(context.Background(), mcp.CallToolRequest{Params: mcp.CallToolParams{Arguments: "invalid"}})
 	assertToolError(t, result, err)
 	if calls != 0 {
 		t.Fatalf("invalid arguments issued %d HTTP calls", calls)
@@ -1993,7 +2012,19 @@ func TestHandleReadQueries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	search := `{"results":[{"content":{"id":"123","type":"page","space":{"key":"TS"},"body":{"storage":{"value":"<p>C</p>","representation":"storage"}}}}],"start":0,"limit":25,"_links":{"next":"/rest/api/search?start=25"}}`
+	search := `{
+		"results":[{"content":{"id":"123","type":"page","space":{"key":"TS"},"body":{"storage":{"value":"<p>C &amp; D</p>\n<p>More</p>","representation":"storage"}},"_expandable":{"history":""},"_links":{"self":"/rest/api/content/123","webui":"/pages/123"},"custom":{"retained":true}},"iconCssClass":"aui-icon content-type-page","friendlyLastModified":"yesterday","lastModified":"2026-10-22T00:00:00Z","timestamp":1792627200000,"excerpt":"C &amp; D","url":"/pages/123","resultParentContainer":{"id":"12"}},{"space":{"key":"TS","_expandable":{"homepage":""}},"iconCssClass":"space-icon","friendlyLastModified":"yesterday","_links":{"self":"/rest/api/space/TS"}}],
+		"start":0,"limit":25,"size":2,"totalSize":188,"_links":{"base":"http://example.test"},"custom":{"retained":true}
+	}`
+	compactSearch := `{"results":[{"content":{"id":"123","type":"page","space":{"key":"TS"},"body":{"storage":{"value":"<p>C &amp; D</p>\n<p>More</p>","representation":"storage"}},"_links":{"self":"/rest/api/content/123","webui":"/pages/123"},"custom":{"retained":true}},"lastModified":"2026-10-22T00:00:00Z","timestamp":1792627200000,"excerpt":"C &amp; D","url":"/pages/123","resultParentContainer":{"id":"12"}},{"space":{"key":"TS","_expandable":{"homepage":""}},"_links":{"self":"/rest/api/space/TS"}}],"start":0,"limit":25,"size":2,"totalSize":188,"_links":{"base":"http://example.test"},"custom":{"retained":true}}`
+	var compactFields map[string]any
+	if err := json.Unmarshal([]byte(compactSearch), &compactFields); err != nil {
+		t.Fatal(err)
+	}
+	compactJSON, err := json.Marshal(compactFields)
+	if err != nil {
+		t.Fatal(err)
+	}
 	spaces := `{"results":[{"space":{"key":"TS","name":"Test","homepage":{"id":"123"}}}],"start":0,"limit":25,"_links":{"base":"http://example.test"}}`
 	for _, tc := range []struct {
 		name, tool, path, response, comments string
@@ -2004,6 +2035,9 @@ func TestHandleReadQueries(t *testing.T) {
 		{"get expansion", "confluence_get_content", "/content/123", content, "", map[string]any{"contentId": "123", "expand": "version", "inlineComments": "none", "limit": 10.0, "start": 2.0}, url.Values{"expand": {"version,body.storage"}}, []string{string(contentWithNone)}},
 		{"get no duplicate", "confluence_get_content", "/content/123", content, "", map[string]any{"contentId": "123", "expand": "body.storage", "inlineComments": "none"}, url.Values{"expand": {"body.storage"}}, []string{string(contentWithNone)}},
 		{"search", "confluence_search_content", "/search", search, "", map[string]any{"cql": `title ~ "a\\b"`, "expand": "content.body.storage,content.space"}, url.Values{"cql": {`title ~ "a\\b"`}, "limit": {"25"}, "expand": {"content.body.storage,content.space"}}, []string{search}},
+		{"search compact false", "confluence_search_content", "/search", search, "", map[string]any{"cql": "type=page OR type=space", "compact": false}, url.Values{"cql": {"type=page OR type=space"}, "limit": {"25"}}, []string{search}},
+		{"search compact", "confluence_search_content", "/search", search, "", map[string]any{"cql": "type=page OR type=space", "expand": "content.body.storage,content.space", "compact": true}, url.Values{"cql": {"type=page OR type=space"}, "limit": {"25"}, "expand": {"content.body.storage,content.space"}}, []string{string(compactJSON)}},
+		{"search compact empty", "confluence_search_content", "/search", `{"results":[],"start":0,"limit":5,"size":0,"totalSize":0}`, "", map[string]any{"cql": "type=page", "limit": 5.0, "compact": true}, url.Values{"cql": {"type=page"}, "limit": {"5"}}, []string{`{"limit":5,"results":[],"size":0,"start":0,"totalSize":0}`}},
 		{"spaces default", "confluence_list_spaces", "/search", spaces, "", map[string]any{}, url.Values{"cql": {"type=space"}, "limit": {"25"}}, []string{spaces}},
 		{"space title", "confluence_list_spaces", "/search", spaces, "", map[string]any{"searchText": `a\"quoted"*`, "limit": 0.0, "start": 2.0, "expand": "space.homepage"}, url.Values{"cql": {`type=space AND title ~ "a\\\"quoted\"*"`}, "limit": {"0"}, "start": {"2"}, "expand": {"space.homepage"}}, []string{spaces}},
 	} {

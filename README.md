@@ -204,7 +204,7 @@ This check proves authentication as a known user. Access to individual content a
 
 ### Tool contract
 
-The six tool IDs and their argument names are listed below. Successful calls return the **Confluence REST response JSON as MCP text**. `confluence_get_content` adds an `inlineComments` field for pages/blogposts by default and returns one JSON text block, without a prose preamble. `confluence_get_image` instead returns native MCP image content with text, or a text-only saved-file result, as described below. Validation and API failures return an MCP tool-error result, except comment-loading failures described below. Request context is retained, and the HTTP client has a 30-second timeout.
+The six tool IDs and their argument names are listed below. Successful calls return the **Confluence REST response JSON as MCP text**. `confluence_get_content` adds an `inlineComments` field for pages/blogposts by default and returns one JSON text block, without a prose preamble. `confluence_search_content` can omit three service fields with `compact: true`; its default response is unchanged. `confluence_get_image` instead returns native MCP image content with text, or a text-only saved-file result, as described below. Validation and API failures return an MCP tool-error result, except comment-loading failures described below. Request context is retained, and the HTTP client has a 30-second timeout.
 
 Optional numeric arguments must be finite whole numbers in the REST signed 32-bit integer range. `limit` and `start` accept `0` through `2147483647`; `version` accepts `1` through `2147483647`. Fractional and out-of-range values are rejected. An omitted `limit` defaults to `25`; an explicit `limit: 0` is sent unchanged to Confluence and does not carry a count-only guarantee. Pagination applies only to search and space listing.
 
@@ -249,7 +249,7 @@ Confluence's `depth=all` response is flat, not nested under `children.comment.re
 
 With no inline/resolved comments, `counts` are both zero and `threads` is empty. If inline comment fetching or grouping fails, the page still succeeds, with `inlineComments.warning` and without `counts`/`threads`; this means discussion is unavailable, **not absent**. If only footer counting fails, the page and inline discussion are retained, `warning` describes the footer failure, and `footerComments` is omitted rather than reported as zero.
 
-For insight across pages, the existing search tool can select comments directly: `{"cql":"type=comment AND container=245617220","limit":100,"expand":"content.extensions.inlineProperties,content.extensions.resolution"}`. Results are paginated, so advance `start` with `_links.next`.
+For insight across pages, the existing search tool can select comments directly: `{"cql":"type=comment AND container=245617220","limit":100,"compact":true,"expand":"content.extensions.inlineProperties,content.extensions.resolution"}`. Results are paginated: advance `start` by the returned `size` until `start + size >= totalSize`, even if `_links.next` is absent. An empty page before that boundary does not prove that all results were retrieved.
 
 ### `confluence_search_content`
 
@@ -260,14 +260,18 @@ Search with `GET /search` using caller-supplied CQL, passed through unchanged.
 - `limit` (number, optional): Page size; defaults to `25` when omitted.
 - `start` (number, optional): Zero-based starting index; omitted values use Confluence's default.
 - `expand` (string, optional): Comma-separated native search expansions, such as `content.body.storage,content.space`.
+- `compact` (boolean, optional): Defaults to `false`. With `true`, omit only `results[].content._expandable`, `results[].iconCssClass`, and `results[].friendlyLastModified`. Non-boolean values are rejected before any request. This local option is not sent to Confluence.
 
-The response retains Confluence's paginated `SearchResult` shape: content is nested under `results[].content`, and space results are nested under `results[].space`. It is not flattened into a content array. Use search-specific expansion paths to read nested fields, for example:
+The response retains Confluence's paginated `SearchResult` shape: content is nested under `results[].content`, and space results are nested under `results[].space`. It is not flattened into a content array. Omitted or `false` `compact` returns the REST response unchanged, including formatting. `compact: true` preserves all other fields and values, including links, excerpts, timestamps, explicitly expanded bodies, pagination, and unknown fields; JSON formatting may change. No text is truncated.
+
+For initial navigation, request `limit: 5` and `compact: true`; the default limit remains `25`. The tool fetches only one result page per call. To retrieve all matches, advance `start` by the returned `size` while `start + size < totalSize`. Confluence can omit `_links.next` even when more results exist; do not use its absence as an end-of-results signal. Use search-specific expansion paths to read nested fields, for example:
 
 ```json
 {
   "cql": "type=page",
-  "limit": 25,
+  "limit": 5,
   "start": 0,
+  "compact": true,
   "expand": "content.body.storage,content.space"
 }
 ```

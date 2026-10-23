@@ -688,6 +688,14 @@ func handleSearchContent(client *ConfluenceClient) func(context.Context, mcp.Cal
 			return mcp.NewToolResultError("cql must be a string and is required"), nil
 		}
 
+		compact := false
+		if raw, present := args["compact"]; present {
+			compact, ok = raw.(bool)
+			if !ok {
+				return mcp.NewToolResultError("compact must be a boolean"), nil
+			}
+		}
+
 		query, err := newPaginatedQuery(args)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
@@ -697,6 +705,27 @@ func handleSearchContent(client *ConfluenceClient) func(context.Context, mcp.Cal
 		resp, err := client.doRequest(ctx, "GET", "/search", query, nil)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("error searching content: %v", err)), nil
+		}
+
+		if compact {
+			var page map[string]any
+			decoder := json.NewDecoder(bytes.NewReader(resp))
+			decoder.UseNumber()
+			if err := decoder.Decode(&page); err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("error decoding search results: %v", err)), nil
+			}
+			results, _ := page["results"].([]any)
+			for _, entry := range results {
+				result, _ := entry.(map[string]any)
+				delete(result, "iconCssClass")
+				delete(result, "friendlyLastModified")
+				content, _ := result["content"].(map[string]any)
+				delete(content, "_expandable")
+			}
+			resp, err = json.Marshal(page)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("error encoding search results: %v", err)), nil
+			}
 		}
 
 		return mcp.NewToolResultText(string(resp)), nil
@@ -914,11 +943,12 @@ func setupServer(client *ConfluenceClient) *mcpserver.MCPServer {
 	), handleGetImage(client))
 
 	s.AddTool(mcp.NewTool("confluence_search_content",
-		mcp.WithDescription("Search Confluence 7.9.0 Server (selfhosted) using CQL, e.g. type=comment AND container=<pageId> for comments; returns native SearchResult JSON"),
+		mcp.WithDescription("Search Confluence 7.9.0 Server (selfhosted) using CQL, e.g. type=comment AND container=<pageId> for comments; returns one page of native SearchResult JSON, optionally compacted. For initial navigation use limit=5. Paginate using start/size/totalSize even if _links.next is absent."),
 		mcp.WithString("cql", mcp.Required(), mcp.Description("Confluence Query Language (CQL) search string")),
 		mcp.WithNumber("limit", mcp.Min(0), mcp.Max(maxRESTInt), mcp.MultipleOf(1), mcp.Description("Maximum number of results (default: 25; zero is passed to Confluence)")),
 		mcp.WithNumber("start", mcp.Min(0), mcp.Max(maxRESTInt), mcp.MultipleOf(1), mcp.Description("Zero-based starting index")),
 		mcp.WithString("expand", mcp.Description("Native search expansions, e.g. content.body.storage,content.space")),
+		mcp.WithBoolean("compact", mcp.DefaultBool(false), mcp.Description("Omit only results[].content._expandable, results[].iconCssClass and results[].friendlyLastModified; false returns the unchanged REST response")),
 	), handleSearchContent(client))
 
 	s.AddTool(mcp.NewTool("confluence_create_content",
