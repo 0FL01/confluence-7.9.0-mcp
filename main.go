@@ -390,32 +390,22 @@ func inlineCommentsData(comments []json.RawMessage, mode string) (map[string]any
 		}
 		var item any = raw
 		if mode == "summary" {
-			// Storage often has no newlines; bound the preview even in that case.
-			line, _, _ := strings.Cut(comment.Body.Storage.Value, "\n")
-			preview := []rune(line)
-			if len(preview) > 240 {
-				line = string(preview[:240])
-				// Keep complete markup tokens; the preview is still an XHTML fragment.
-				if open := strings.LastIndexByte(line, '<'); open > strings.LastIndexByte(line, '>') {
-					line = line[:open]
-				}
-				if amp := strings.LastIndexByte(line, '&'); amp > strings.LastIndexByte(line, ';') {
-					line = line[:amp]
-				}
-				line += "…"
-			}
 			summary := map[string]any{
-				"id":                comment.ID,
-				"originalSelection": comment.Extensions.InlineProperties.OriginalSelection,
-				"markerRef":         comment.Extensions.InlineProperties.MarkerRef,
-				"author":            comment.History.CreatedBy.DisplayName,
-				"createdDate":       comment.History.CreatedDate,
-				"version":           comment.Version.Number,
-				"updatedBy":         comment.Version.By.DisplayName,
-				"updatedDate":       comment.Version.When,
-				"bodyPreview":       line,
+				"id":          comment.ID,
+				"author":      comment.History.CreatedBy.DisplayName,
+				"createdDate": comment.History.CreatedDate,
+				"version":     comment.Version.Number,
+				"bodyStorage": comment.Body.Storage.Value,
+			}
+			if comment.Version.By.DisplayName != comment.History.CreatedBy.DisplayName {
+				summary["updatedBy"] = comment.Version.By.DisplayName
+			}
+			if comment.Version.When != comment.History.CreatedDate {
+				summary["updatedDate"] = comment.Version.When
 			}
 			if comment.Extensions.InlineProperties.OriginalSelection != "" {
+				summary["originalSelection"] = comment.Extensions.InlineProperties.OriginalSelection
+				summary["markerRef"] = comment.Extensions.InlineProperties.MarkerRef
 				summary["status"] = comment.Extensions.Resolution.Status
 			}
 			item = summary
@@ -911,10 +901,10 @@ func setupServer(client *ConfluenceClient) *mcpserver.MCPServer {
 	)
 
 	s.AddTool(mcp.NewTool("confluence_get_content",
-		mcp.WithDescription("Get content by ID from Confluence 7.9.0 Server (selfhosted). One JSON object; pages/blogposts include inlineComments (resolved included, footer excluded but counted). Read this discussion context before relying on the body; check warning if unavailable. Default summary has bounded XHTML previews and status only on roots; use full for complete comments or none to skip requests with an explicit mode marker. Threads use originalSelection and response order, not explicit parent IDs."),
+		mcp.WithDescription("Get content by ID from Confluence 7.9.0 Server (selfhosted). One JSON object; pages/blogposts include inlineComments (resolved included, footer excluded but counted). Read this discussion context before relying on the body; check warning if unavailable. Default summary keeps full comment XHTML as bodyStorage with compact metadata; anchors/status only on roots. Omitted updatedBy/updatedDate equal author/createdDate respectively. Use full for raw comments or none to skip requests with an explicit mode marker. Threads use originalSelection and response order, not explicit parent IDs."),
 		mcp.WithString("contentId", mcp.Required(), mcp.Description("Confluence content ID")),
 		mcp.WithString("expand", mcp.Description("Comma-separated list of properties to expand")),
-		mcp.WithString("inlineComments", mcp.Enum("none", "summary", "full"), mcp.DefaultString("summary"), mcp.Description("Inline/resolved discussion: summary (default, status on roots only), full (raw comments grouped into root/replies), or none (no comment requests; returns mode:none). Footer comments are excluded; summary/full report their count as footerComments.")),
+		mcp.WithString("inlineComments", mcp.Enum("none", "summary", "full"), mcp.DefaultString("summary"), mcp.Description("Inline/resolved discussion: summary (default, full bodyStorage with compact metadata), full (raw comments grouped into root/replies), or none (no comment requests; returns mode:none). Footer comments are excluded; summary/full report their count as footerComments.")),
 	), handleGetContent(client))
 
 	s.AddTool(mcp.NewTool("confluence_get_image",

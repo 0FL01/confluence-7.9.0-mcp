@@ -305,9 +305,9 @@ func TestHandleGetContent(t *testing.T) {
 func TestHandleGetContentInlineComments(t *testing.T) {
 	ctx := context.Background()
 	const pageJSON = `{"id":"123","type":"page","title":"P","body":{"storage":{"value":"<p>P</p>","representation":"storage"}}}`
-	const openComment = `{"id":"9","type":"comment","extensions":{"location":"inline","inlineProperties":{"originalSelection":"horizontal","markerRef":"m1"},"resolution":{"status":"open"}},"history":{"createdBy":{"displayName":"Olga"},"createdDate":"2026-01-01T00:00:00Z"},"version":{"number":2,"by":{"displayName":"Editor"},"when":"2026-02-01T00:00:00Z"},"body":{"storage":{"value":"<p>Use the scroll</p>\n<p>More detail</p>","representation":"storage"}}}`
-	const resolvedComment = `{"id":"10","type":"comment","extensions":{"location":"inline","inlineProperties":{"originalSelection":"centering","markerRef":"m2"},"resolution":{"status":"resolved"}},"body":{"storage":{"value":"<p>No centering</p>","representation":"storage"}}}`
-	reply := `{"id":"11","type":"comment","extensions":{"location":"inline","inlineProperties":{"originalSelection":"","markerRef":""},"resolution":{"status":"open"}},"body":{"storage":{"value":"` + strings.Repeat("я", 300) + `","representation":"storage"}}}`
+	const openComment = `{"id":"9","type":"comment","extensions":{"location":"inline","inlineProperties":{"originalSelection":"horizontal","markerRef":"m1"},"resolution":{"status":"open"}},"history":{"createdBy":{"displayName":"Olga"},"createdDate":"2026-01-01T00:00:00Z"},"version":{"number":2,"by":{"displayName":"Editor"},"when":"2026-01-01T00:00:00Z"},"body":{"storage":{"value":"<p>Use the scroll &amp; keep context</p>\n<p>More detail</p>","representation":"storage"}}}`
+	const resolvedComment = `{"id":"10","type":"comment","extensions":{"location":"inline","inlineProperties":{"originalSelection":"centering","markerRef":"m2"},"resolution":{"status":"resolved"}},"history":{"createdBy":{"displayName":"Olga"},"createdDate":"2026-01-01T00:00:00Z"},"version":{"number":1,"by":{"displayName":"Olga"},"when":"2026-01-01T00:00:00Z"},"body":{"storage":{"value":"<p>No centering</p>","representation":"storage"}}}`
+	reply := `{"id":"11","type":"comment","extensions":{"location":"inline","inlineProperties":{"originalSelection":"","markerRef":""},"resolution":{"status":"open"}},"history":{"createdBy":{"displayName":"Eugene"},"createdDate":"2026-01-01T00:00:00Z"},"version":{"number":2,"by":{"displayName":"Eugene"},"when":"2026-02-01T00:00:00Z"},"body":{"storage":{"value":"<p>` + strings.Repeat("я", 300) + ` &amp; &quot;more&quot;</p>\n<ac:link><ri:user ri:userkey=\"user\" /></ac:link>","representation":"storage"}}}`
 	req := mcp.CallToolRequest{Params: mcp.CallToolParams{Arguments: map[string]any{"contentId": "123"}}}
 
 	newClient := func(t *testing.T, content, comments string, commentsStatus int) *ConfluenceClient {
@@ -410,18 +410,29 @@ func TestHandleGetContentInlineComments(t *testing.T) {
 			if discussion.Threads[0].Root["id"] != "9" || discussion.Threads[1].Root["id"] != "10" || discussion.Threads[1].Replies[0]["id"] != "11" {
 				t.Errorf("reply attributed to the wrong root: %+v", discussion.Threads)
 			}
+			items := []map[string]any{discussion.Threads[0].Root, discussion.Threads[1].Root, discussion.Threads[1].Replies[0]}
 			if mode == "summary" {
-				wantRoot := map[string]any{
-					"id": "9", "originalSelection": "horizontal", "markerRef": "m1", "status": "open",
-					"author": "Olga", "createdDate": "2026-01-01T00:00:00Z", "version": float64(2),
-					"updatedBy": "Editor", "updatedDate": "2026-02-01T00:00:00Z", "bodyPreview": "<p>Use the scroll</p>",
+				want := []map[string]any{
+					{
+						"id": "9", "originalSelection": "horizontal", "markerRef": "m1", "status": "open",
+						"author": "Olga", "createdDate": "2026-01-01T00:00:00Z", "version": float64(2),
+						"updatedBy": "Editor", "bodyStorage": "<p>Use the scroll &amp; keep context</p>\n<p>More detail</p>",
+					},
+					{
+						"id": "10", "originalSelection": "centering", "markerRef": "m2", "status": "resolved",
+						"author": "Olga", "createdDate": "2026-01-01T00:00:00Z", "version": float64(1),
+						"bodyStorage": "<p>No centering</p>",
+					},
+					{
+						"id": "11", "author": "Eugene", "createdDate": "2026-01-01T00:00:00Z", "version": float64(2),
+						"updatedDate": "2026-02-01T00:00:00Z",
+						"bodyStorage": "<p>" + strings.Repeat("я", 300) + " &amp; &quot;more&quot;</p>\n<ac:link><ri:user ri:userkey=\"user\" /></ac:link>",
+					},
 				}
-				if !reflect.DeepEqual(discussion.Threads[0].Root, wantRoot) || discussion.Threads[1].Root["status"] != "resolved" ||
-					discussion.Threads[1].Replies[0]["bodyPreview"] != strings.Repeat("я", 240)+"…" || discussion.Threads[1].Replies[0]["status"] != nil {
-					t.Errorf("summary fields or bounded preview: %+v", discussion.Threads)
+				if !reflect.DeepEqual(items, want) {
+					t.Errorf("summary fields or full storage bodies: got %+v, want %+v", items, want)
 				}
 			} else {
-				items := []map[string]any{discussion.Threads[0].Root, discussion.Threads[1].Root, discussion.Threads[1].Replies[0]}
 				for i, raw := range []string{openComment, resolvedComment, reply} {
 					var want map[string]any
 					if err := json.Unmarshal([]byte(raw), &want); err != nil {
@@ -448,42 +459,6 @@ func TestHandleGetContentInlineComments(t *testing.T) {
 			}
 			if !reflect.DeepEqual(footerStarts, []string{"0", "2"}) {
 				t.Errorf("footer pagination starts: %v", footerStarts)
-			}
-		})
-	}
-
-	for _, tc := range []struct {
-		name, suffix string
-	}{
-		{"preview cut inside a tag", `<ac:link><ri:user ri:userkey="user" /></ac:link>`},
-		{"preview cut inside an entity", `&quot;more text`},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			prefix := strings.Repeat("я", 238)
-			body, err := json.Marshal(prefix + tc.suffix)
-			if err != nil {
-				t.Fatal(err)
-			}
-			comment := `{"extensions":{"inlineProperties":{"originalSelection":"quote"}},"body":{"storage":{"value":` + string(body) + `}}}`
-			client := newClient(t, pageJSON, `{"results":[`+comment+`]}`, http.StatusOK)
-			result, err := handleGetContent(client)(ctx, req)
-			if err != nil || result.IsError || len(result.Content) != 1 {
-				t.Fatalf("expected page with preview: %v, %v", result, err)
-			}
-			var got struct {
-				InlineComments struct {
-					Threads []struct {
-						Root struct {
-							BodyPreview string `json:"bodyPreview"`
-						} `json:"root"`
-					} `json:"threads"`
-				} `json:"inlineComments"`
-			}
-			if err := json.Unmarshal([]byte(result.Content[0].(mcp.TextContent).Text), &got); err != nil {
-				t.Fatal(err)
-			}
-			if len(got.InlineComments.Threads) != 1 || got.InlineComments.Threads[0].Root.BodyPreview != prefix+"…" {
-				t.Errorf("preview contains a partial XHTML token: %+v", got)
 			}
 		})
 	}
