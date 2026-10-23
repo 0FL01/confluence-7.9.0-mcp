@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -21,14 +24,16 @@ import (
 
 // ConfluenceConfig holds the configuration for the Confluence client.
 type ConfluenceConfig struct {
-	BaseURL string
-	Token   string
+	BaseURL  string
+	Login    string
+	Password string
 }
 
 const (
 	// defaultLimit is the default number of results for paginated requests.
-	defaultLimit = 25
-	maxRESTInt   = 1<<31 - 1
+	defaultLimit  = 25
+	maxRESTInt    = 1<<31 - 1
+	maxImageBytes = 5 << 20
 )
 
 // loadConfig reads cwd/.env without changing ENV; existing ENV wins per key.
@@ -44,9 +49,16 @@ func loadConfig() (*ConfluenceConfig, error) {
 		}
 		return fileEnv[name]
 	}
-	token := getEnv("CONFLUENCE_API_TOKEN")
-	if token == "" {
-		return nil, fmt.Errorf("CONFLUENCE_API_TOKEN is required (ENV or cwd/.env)")
+	login := getEnv("CONFLUENCE_LOGIN")
+	if login == "" {
+		return nil, fmt.Errorf("CONFLUENCE_LOGIN is required (ENV or cwd/.env)")
+	}
+	if strings.Contains(login, ":") {
+		return nil, fmt.Errorf("CONFLUENCE_LOGIN must not contain a colon")
+	}
+	password := getEnv("CONFLUENCE_PASS")
+	if password == "" {
+		return nil, fmt.Errorf("CONFLUENCE_PASS is required (ENV or cwd/.env)")
 	}
 
 	rawURL := getEnv("CONFLUENCE_BASE_URL")
@@ -88,8 +100,9 @@ func loadConfig() (*ConfluenceConfig, error) {
 	}
 
 	return &ConfluenceConfig{
-		BaseURL: u.String(),
-		Token:   token,
+		BaseURL:  u.String(),
+		Login:    login,
+		Password: password,
 	}, nil
 }
 
@@ -168,7 +181,7 @@ func (c *ConfluenceClient) executeRequest(ctx context.Context, method, path stri
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	req.Header.Set("Authorization", "Bearer "+c.config.Token)
+	req.SetBasicAuth(c.config.Login, c.config.Password)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
@@ -222,6 +235,79 @@ func (c *ConfluenceClient) getJSON(ctx context.Context, path string, query url.V
 		return fmt.Errorf("failed to decode JSON: %w", err)
 	}
 	return nil
+}
+
+// getImage retrieves original image bytes without redirects, reencoding or disk writes.
+func (c *ConfluenceClient) getImage(ctx context.Context, attachmentID string) ([]byte, string, error) {
+	var attachment struct {
+		Type  string `json:"type"`
+		Links struct {
+			Download string `json:"download"`
+		} `json:"_links"`
+	}
+	if err := c.getJSON(ctx, "/content/"+url.PathEscape(attachmentID), nil, &attachment); err != nil {
+		return nil, "", err
+	}
+	if attachment.Type != "attachment" || attachment.Links.Download == "" {
+		return nil, "", fmt.Errorf("content is not an attachment with a download link")
+	}
+	base, err := url.Parse(c.config.BaseURL)
+	if err != nil {
+		return nil, "", fmt.Errorf("invalid base URL")
+	}
+	download, err := url.Parse(attachment.Links.Download)
+	if err != nil || download.User != nil || strings.Contains(attachment.Links.Download, "#") || download.Opaque != "" {
+		return nil, "", fmt.Errorf("invalid attachment download URL")
+	}
+	sitePath := strings.TrimSuffix(base.Path, "/rest/api")
+	if !download.IsAbs() && download.Host == "" {
+		// Confluence links beginning /download are relative to its site context.
+		if strings.HasPrefix(download.Path, "/download/attachments/") {
+			escapedPath := download.EscapedPath()
+			download.Path = sitePath + download.Path
+			download.RawPath = strings.TrimSuffix(base.EscapedPath(), "/rest/api") + escapedPath
+		}
+		download.Scheme, download.Host = base.Scheme, base.Host
+	}
+	if download.Scheme != base.Scheme || !strings.EqualFold(download.Host, base.Host) ||
+		!strings.HasPrefix(download.Path, sitePath+"/download/attachments/") ||
+		path.Clean(download.Path) != download.Path || strings.Contains(download.Path, "\\") {
+		return nil, "", fmt.Errorf("attachment download URL must stay on the configured origin and attachment path")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, download.String(), nil)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to create image request")
+	}
+	req.SetBasicAuth(c.config.Login, c.config.Password)
+	req.Header.Set("Accept", "image/png, image/jpeg, image/gif, image/webp")
+	client := *c.httpClient
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := client.Do(req)
+	if err != nil {
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) {
+			err = urlErr.Err
+		}
+		return nil, "", fmt.Errorf("image download failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", fmt.Errorf("image download returned HTTP %d %s", resp.StatusCode, http.StatusText(resp.StatusCode))
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxImageBytes+1))
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to read image: %w", err)
+	}
+	if len(data) > maxImageBytes {
+		return nil, "", fmt.Errorf("image exceeds 5 MiB")
+	}
+	mimeType := http.DetectContentType(data)
+	switch mimeType {
+	case "image/png", "image/jpeg", "image/gif", "image/webp":
+		return data, mimeType, nil
+	default:
+		return nil, "", fmt.Errorf("attachment is not a supported PNG, JPEG, GIF or WebP image")
+	}
 }
 
 // SpaceRef represents a reference to a Confluence space in API responses/requests.
@@ -370,6 +456,48 @@ func handleGetContent(client *ConfluenceClient) func(context.Context, mcp.CallTo
 		}
 
 		return mcp.NewToolResultText(string(resp)), nil
+	}
+}
+
+// handleGetImage returns one image inline or saves it into an explicit directory.
+func handleGetImage(client *ConfluenceClient) func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		args, err := getArguments(req)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		attachmentID, ok := args["attachmentId"].(string)
+		if !ok || attachmentID == "" || strings.Contains(attachmentID, "/") || strings.Contains(attachmentID, "..") {
+			return mcp.NewToolResultError("attachmentId must be a nonempty string without / or .."), nil
+		}
+		downloadDir := ""
+		if raw, present := args["downloadDir"]; present {
+			downloadDir, ok = raw.(string)
+			if !ok || (downloadDir != "" && !filepath.IsAbs(downloadDir)) {
+				return mcp.NewToolResultError("downloadDir must be a string containing an absolute path to an existing directory"), nil
+			}
+		}
+		data, mimeType, err := client.getImage(ctx, attachmentID)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("error getting image: %v", err)), nil
+		}
+		if downloadDir == "" {
+			return mcp.NewToolResultImage("Attachment "+attachmentID, base64.StdEncoding.EncodeToString(data), mimeType), nil
+		}
+		file, err := os.CreateTemp(downloadDir, "confluence-attachment-"+attachmentID+"-*."+strings.TrimPrefix(mimeType, "image/"))
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("failed to save image: %v", err)), nil
+		}
+		_, writeErr := file.Write(data)
+		closeErr := file.Close()
+		if err := errors.Join(writeErr, closeErr); err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("failed to save image: %v", errors.Join(err, os.Remove(file.Name())))), nil
+		}
+		saved, err := json.Marshal([]map[string]any{{"id": attachmentID, "path": file.Name(), "mimeType": mimeType, "size": len(data)}})
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("failed to describe saved image: %v", err)), nil
+		}
+		return mcp.NewToolResultText("Saved attachment " + attachmentID + ". Open the path with a local image reader and delete the file when finished.\n\n" + string(saved)), nil
 	}
 }
 
@@ -603,6 +731,12 @@ func setupServer(client *ConfluenceClient) *mcpserver.MCPServer {
 		mcp.WithString("contentId", mcp.Required(), mcp.Description("Confluence content ID")),
 		mcp.WithString("expand", mcp.Description("Comma-separated list of properties to expand")),
 	), handleGetContent(client))
+
+	s.AddTool(mcp.NewTool("confluence_get_image",
+		mcp.WithDescription("View an image attachment from Confluence 7.9.0 Server (selfhosted), or save it into an existing absolute downloadDir and return its path instead of image content. PNG/JPEG/GIF/WebP, up to 5 MiB, original bytes. Discover attachmentId using CQL type=attachment AND container=<pageId>. Open saved files with a local image reader and delete them when finished; no disk writes without downloadDir."),
+		mcp.WithString("attachmentId", mcp.Required(), mcp.Description("Confluence attachment content ID")),
+		mcp.WithString("downloadDir", mcp.Description("Existing absolute directory on the MCP server filesystem, e.g. the agent workspace; omitted or empty returns a native image without saving")),
+	), handleGetImage(client))
 
 	s.AddTool(mcp.NewTool("confluence_search_content",
 		mcp.WithDescription("Search Confluence 7.9.0 Server (selfhosted) using CQL; returns native SearchResult JSON"),

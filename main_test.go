@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -39,8 +41,9 @@ func TestLoadConfig(t *testing.T) {
 		{
 			name: "valid config with CONFLUENCE_BASE_URL",
 			env: map[string]string{
-				"CONFLUENCE_API_TOKEN": "test-token",
-				"CONFLUENCE_BASE_URL":  "https://example.atlassian.net",
+				"CONFLUENCE_LOGIN":    "test-user",
+				"CONFLUENCE_PASS":     " \tpassword:with:colons \n",
+				"CONFLUENCE_BASE_URL": "https://example.atlassian.net",
 			},
 			wantErr: false,
 			wantURL: "https://example.atlassian.net/rest/api",
@@ -48,15 +51,42 @@ func TestLoadConfig(t *testing.T) {
 		{
 			name: "valid config with CONFLUENCE_HOST",
 			env: map[string]string{
-				"CONFLUENCE_API_TOKEN": "test-token",
-				"CONFLUENCE_HOST":      "example.atlassian.net",
+				"CONFLUENCE_LOGIN": "test-user",
+				"CONFLUENCE_PASS":  "test-password",
+				"CONFLUENCE_HOST":  "example.atlassian.net",
 			},
 			wantErr: false,
 			wantURL: "https://example.atlassian.net/rest/api",
 		},
 		{
-			name: "missing token",
+			name: "missing login",
 			env: map[string]string{
+				"CONFLUENCE_PASS":     "test-password",
+				"CONFLUENCE_BASE_URL": "https://example.atlassian.net",
+			},
+			wantErr: true,
+		},
+		{
+			name: "missing password",
+			env: map[string]string{
+				"CONFLUENCE_LOGIN":    "test-user",
+				"CONFLUENCE_BASE_URL": "https://example.atlassian.net",
+			},
+			wantErr: true,
+		},
+		{
+			name: "legacy token alone is not authentication",
+			env: map[string]string{
+				"CONFLUENCE_API_TOKEN": "legacy-token",
+				"CONFLUENCE_BASE_URL":  "https://example.atlassian.net",
+			},
+			wantErr: true,
+		},
+		{
+			name: "login cannot contain colon",
+			env: map[string]string{
+				"CONFLUENCE_LOGIN":    "test:user",
+				"CONFLUENCE_PASS":     "test-password",
 				"CONFLUENCE_BASE_URL": "https://example.atlassian.net",
 			},
 			wantErr: true,
@@ -64,23 +94,26 @@ func TestLoadConfig(t *testing.T) {
 		{
 			name: "missing URL",
 			env: map[string]string{
-				"CONFLUENCE_API_TOKEN": "test-token",
+				"CONFLUENCE_LOGIN": "test-user",
+				"CONFLUENCE_PASS":  "test-password",
 			},
 			wantErr: true,
 		},
 		{
 			name: "invalid URL format",
 			env: map[string]string{
-				"CONFLUENCE_API_TOKEN": "test-token",
-				"CONFLUENCE_BASE_URL":  "://invalid-url",
+				"CONFLUENCE_LOGIN":    "test-user",
+				"CONFLUENCE_PASS":     "test-password",
+				"CONFLUENCE_BASE_URL": "://invalid-url",
 			},
 			wantErr: true,
 		},
 		{
 			name: "invalid URL scheme",
 			env: map[string]string{
-				"CONFLUENCE_API_TOKEN": "test-token",
-				"CONFLUENCE_BASE_URL":  "ftp://example.com",
+				"CONFLUENCE_LOGIN":    "test-user",
+				"CONFLUENCE_PASS":     "test-password",
+				"CONFLUENCE_BASE_URL": "ftp://example.com",
 			},
 			wantErr: true,
 		},
@@ -99,6 +132,9 @@ func TestLoadConfig(t *testing.T) {
 			}
 			if !tt.wantErr && config.BaseURL != tt.wantURL {
 				t.Errorf("loadConfig() BaseURL = %v, want %v", config.BaseURL, tt.wantURL)
+			}
+			if !tt.wantErr && (config.Login != tt.env["CONFLUENCE_LOGIN"] || config.Password != tt.env["CONFLUENCE_PASS"]) {
+				t.Error("loadConfig() changed login or password")
 			}
 		})
 	}
@@ -184,8 +220,9 @@ func TestHandleGetContent(t *testing.T) {
 	defer server.Close()
 
 	client := NewConfluenceClient(&ConfluenceConfig{
-		BaseURL: server.URL + "/rest/api",
-		Token:   "test-token",
+		BaseURL:  server.URL + "/rest/api",
+		Login:    "test-user",
+		Password: "test-password",
 	})
 
 	handler := handleGetContent(client)
@@ -254,7 +291,7 @@ func TestHandleGetContent(t *testing.T) {
 		}))
 		defer errServer.Close()
 
-		errClient := NewConfluenceClient(&ConfluenceConfig{BaseURL: errServer.URL, Token: "token"})
+		errClient := NewConfluenceClient(&ConfluenceConfig{BaseURL: errServer.URL, Login: "test-user", Password: "test-password"})
 		errHandler := handleGetContent(errClient)
 		result, err := errHandler(ctx, req)
 		assertToolError(t, result, err)
@@ -281,8 +318,9 @@ func TestHandleListSpaces(t *testing.T) {
 	defer server.Close()
 
 	client := NewConfluenceClient(&ConfluenceConfig{
-		BaseURL: server.URL + "/rest/api",
-		Token:   "test-token",
+		BaseURL:  server.URL + "/rest/api",
+		Login:    "test-user",
+		Password: "test-password",
 	})
 
 	handler := handleListSpaces(client)
@@ -317,6 +355,341 @@ func TestHandleListSpaces(t *testing.T) {
 	})
 }
 
+func TestHandleGetImage(t *testing.T) {
+	const pngBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="
+	pngData, err := base64.StdEncoding.DecodeString(pngBase64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(t.TempDir())
+	const downloadPath = "/my%20wiki/download/attachments/123/a%20%23%3F.png?version=2&x=one%2Btwo"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		login, password, ok := r.BasicAuth()
+		if r.Method != http.MethodGet || !ok || login != "test-user" || password != "test:password" || r.Header.Get("Cookie") != "" {
+			t.Errorf("unexpected image method/auth: %s %s", r.Method, r.URL)
+		}
+		switch r.RequestURI {
+		case "/my%20wiki/rest/api/content/att123":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "att123", "type": "attachment", "_links": map[string]string{"download": downloadPath}})
+		case downloadPath:
+			// MIME sniffing, not the response header, determines the native image type.
+			w.Header().Set("Content-Type", "application/octet-stream")
+			_, _ = w.Write(pngData)
+		default:
+			t.Errorf("unexpected image URL: %s", r.RequestURI)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL + "/my%20wiki/rest/api", Login: "test-user", Password: "test:password"})
+	handler := handleGetImage(client)
+	for _, tc := range []struct {
+		name string
+		args map[string]any
+	}{
+		{"inline", map[string]any{"attachmentId": "att123"}},
+		{"empty directory is inline", map[string]any{"attachmentId": "att123", "downloadDir": ""}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := handler(context.Background(), mcp.CallToolRequest{Params: mcp.CallToolParams{Arguments: tc.args}})
+			if err != nil || result == nil || result.IsError || len(result.Content) != 2 {
+				t.Fatalf("expected native image and text: %v, %v", result, err)
+			}
+			images, texts := 0, 0
+			for _, content := range result.Content {
+				switch content := content.(type) {
+				case mcp.ImageContent:
+					images++
+					data, err := base64.StdEncoding.DecodeString(content.Data)
+					if err != nil || content.MIMEType != "image/png" || !bytes.Equal(data, pngData) {
+						t.Fatalf("native image changed original bytes/type: %v", err)
+					}
+				case mcp.TextContent:
+					texts++
+					if !strings.Contains(content.Text, "att123") {
+						t.Errorf("missing attachment ID in image text: %q", content.Text)
+					}
+				default:
+					t.Fatalf("unexpected inline content %T", content)
+				}
+			}
+			if images != 1 || texts != 1 {
+				t.Fatalf("inline images=%d texts=%d", images, texts)
+			}
+			if files, err := os.ReadDir("."); err != nil || len(files) != 0 {
+				t.Fatalf("inline request created files: %v, %v", files, err)
+			}
+		})
+	}
+	t.Run("save outside cwd with unique names", func(t *testing.T) {
+		dir := t.TempDir()
+		cwd, err := os.Getwd()
+		if err != nil || dir == cwd || strings.HasPrefix(dir, cwd+string(os.PathSeparator)) {
+			t.Fatalf("save fixture must be outside cwd: %s, %v", dir, err)
+		}
+		existing := filepath.Join(dir, "confluence-attachment-att123.png")
+		if err := os.WriteFile(existing, []byte("keep existing file"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		var paths []string
+		for range 2 {
+			result, err := handler(context.Background(), mcp.CallToolRequest{Params: mcp.CallToolParams{Arguments: map[string]any{"attachmentId": "att123", "downloadDir": dir}}})
+			if err != nil || result == nil || result.IsError || len(result.Content) != 1 {
+				t.Fatalf("expected text-only saved result: %v, %v", result, err)
+			}
+			text, ok := result.Content[0].(mcp.TextContent)
+			if !ok {
+				t.Fatalf("saved result must not contain native image content: %T", result.Content[0])
+			}
+			summary, rawFiles, found := strings.Cut(text.Text, "\n\n")
+			if !found || !strings.Contains(summary, "att123") || !strings.Contains(strings.ToLower(summary), "open") || !strings.Contains(strings.ToLower(summary), "delete") {
+				t.Fatalf("expected summary followed by file JSON: %q", text.Text)
+			}
+			var files []map[string]any
+			if err := json.Unmarshal([]byte(rawFiles), &files); err != nil || len(files) != 1 || len(files[0]) != 4 {
+				t.Fatalf("saved file array: %v, %v", files, err)
+			}
+			file := files[0]
+			path, ok := file["path"].(string)
+			if !ok || !filepath.IsAbs(path) || filepath.Dir(path) != dir || file["id"] != "att123" || file["mimeType"] != "image/png" || file["size"] != float64(len(pngData)) {
+				t.Fatalf("saved file metadata: %v", file)
+			}
+			name := filepath.Base(path)
+			if !strings.HasPrefix(name, "confluence-attachment-att123-") || !strings.HasSuffix(name, ".png") || name == "confluence-attachment-att123-.png" || slices.Contains(paths, path) {
+				t.Fatalf("saved filename is not unique: %s", name)
+			}
+			paths = append(paths, path)
+			data, err := os.ReadFile(path)
+			if err != nil || !bytes.Equal(data, pngData) {
+				t.Fatalf("saved bytes changed: %v", err)
+			}
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if runtime.GOOS != "windows" && info.Mode().Perm() != 0600 {
+				t.Errorf("saved file mode: %o, want 600", info.Mode().Perm())
+			}
+		}
+		if data, err := os.ReadFile(existing); err != nil || string(data) != "keep existing file" {
+			t.Fatalf("save overwrote existing file: %v", err)
+		}
+		for _, path := range paths {
+			if data, err := os.ReadFile(path); err != nil || !bytes.Equal(data, pngData) {
+				t.Fatalf("later save overwrote earlier file: %v", err)
+			}
+		}
+		if files, err := os.ReadDir(dir); err != nil || len(files) != 3 {
+			t.Fatalf("unexpected saved files: %v, %v", files, err)
+		}
+	})
+	t.Run("invalid save directories do not write", func(t *testing.T) {
+		dir := t.TempDir()
+		existing := filepath.Join(dir, "not-a-directory")
+		if err := os.WriteFile(existing, []byte("unchanged"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		for _, path := range []string{filepath.Join(dir, "missing"), existing} {
+			result, err := handler(context.Background(), mcp.CallToolRequest{Params: mcp.CallToolParams{Arguments: map[string]any{"attachmentId": "att123", "downloadDir": path}}})
+			assertToolError(t, result, err)
+		}
+		if data, err := os.ReadFile(existing); err != nil || string(data) != "unchanged" {
+			t.Fatalf("invalid directory request changed existing file: %v", err)
+		}
+		if files, err := os.ReadDir(dir); err != nil || len(files) != 1 {
+			t.Fatalf("invalid directory request created files/directories: %v, %v", files, err)
+		}
+		if files, err := os.ReadDir("."); err != nil || len(files) != 0 {
+			t.Fatalf("save used cwd fallback: %v, %v", files, err)
+		}
+	})
+
+	var foreignCalls atomic.Int32
+	foreign := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		foreignCalls.Add(1)
+		t.Error("image request reached a foreign endpoint")
+		_, _ = w.Write(pngData)
+	}))
+	defer foreign.Close()
+	oversized := append(bytes.Clone(pngData), make([]byte, maxImageBytes+1-len(pngData))...)
+	for _, tc := range []struct {
+		name, metadataType, link, wantError string
+		metadataStatus, downloadStatus      int
+		missingLink, noDownload, chunked    bool
+		payload                             []byte
+	}{
+		{name: "metadata is not attachment", metadataType: "page", noDownload: true, wantError: "attachment"},
+		{name: "metadata missing download link", missingLink: true, noDownload: true, wantError: "download link"},
+		{name: "metadata HTTP error", metadataStatus: 404, noDownload: true, wantError: "404"},
+		{name: "off-origin download", link: foreign.URL + "/my%20wiki/download/attachments/123/a.png", noDownload: true, wantError: "configured origin"},
+		{name: "outside configured context", link: "/other/download/attachments/123/a.png", noDownload: true, wantError: "attachment path"},
+		{name: "encoded traversal", link: "/my%20wiki/download/attachments/123/%2e%2e/%2e%2e/private.png", noDownload: true, wantError: "attachment path"},
+		{name: "download redirect is not followed", downloadStatus: 302, wantError: "302"},
+		{name: "download forbidden without raw body", downloadStatus: 403, wantError: "403"},
+		{name: "HTML mislabeled as PNG", payload: []byte("<html>SECRET_RESPONSE_MARKER</html>"), wantError: "supported"},
+		{name: "chunked oversized image", payload: oversized, chunked: true, wantError: "5 MiB"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var downloadCalls atomic.Int32
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				login, password, ok := r.BasicAuth()
+				if !ok || login != "test-user" || password != "test-password" {
+					t.Error("image request lost Basic authentication")
+				}
+				if r.URL.EscapedPath() == "/my%20wiki/rest/api/content/att123" {
+					if tc.metadataStatus != 0 {
+						http.Error(w, "metadata unavailable", tc.metadataStatus)
+						return
+					}
+					kind, link := tc.metadataType, tc.link
+					if kind == "" {
+						kind = "attachment"
+					}
+					if link == "" && !tc.missingLink {
+						link = "/download/attachments/123/a.png"
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{"type": kind, "_links": map[string]string{"download": link}})
+					return
+				}
+				downloadCalls.Add(1)
+				if r.RequestURI != "/my%20wiki/download/attachments/123/a.png" {
+					t.Errorf("unsafe or altered download path: %s", r.RequestURI)
+				}
+				if tc.downloadStatus != 0 {
+					w.Header().Set("Location", foreign.URL+"/redirect-target")
+					w.WriteHeader(tc.downloadStatus)
+					_, _ = w.Write([]byte("SECRET_RESPONSE_MARKER"))
+					return
+				}
+				w.Header().Set("Content-Type", "image/png")
+				if tc.chunked {
+					w.(http.Flusher).Flush()
+				} else {
+					w.Header().Set("Content-Length", fmt.Sprint(len(tc.payload)))
+				}
+				_, _ = w.Write(tc.payload)
+			}))
+			defer backend.Close()
+			dir := t.TempDir()
+			existing := filepath.Join(dir, "confluence-attachment-att123.png")
+			if err := os.WriteFile(existing, []byte("unchanged"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			client := NewConfluenceClient(&ConfluenceConfig{BaseURL: backend.URL + "/my%20wiki/rest/api", Login: "test-user", Password: "test-password"})
+			result, err := handleGetImage(client)(context.Background(), mcp.CallToolRequest{Params: mcp.CallToolParams{Arguments: map[string]any{"attachmentId": "att123", "downloadDir": dir}}})
+			assertToolError(t, result, err)
+			text := result.Content[0].(mcp.TextContent).Text
+			if !strings.Contains(text, tc.wantError) || strings.Contains(text, "SECRET_RESPONSE_MARKER") {
+				t.Fatalf("image error = %q, want %q without response body", text, tc.wantError)
+			}
+			wantCalls := int32(1)
+			if tc.noDownload {
+				wantCalls = 0
+			}
+			if downloadCalls.Load() != wantCalls {
+				t.Errorf("download calls=%d, want %d", downloadCalls.Load(), wantCalls)
+			}
+			if data, err := os.ReadFile(existing); err != nil || string(data) != "unchanged" {
+				t.Fatalf("failed HTTP request overwrote existing file: %v", err)
+			}
+			if files, err := os.ReadDir(dir); err != nil || len(files) != 1 {
+				t.Fatalf("failed HTTP request left files: %v, %v", files, err)
+			}
+		})
+	}
+	if foreignCalls.Load() != 0 {
+		t.Fatalf("foreign endpoint called %d times", foreignCalls.Load())
+	}
+
+	t.Run("context escaped ID and body ownership", func(t *testing.T) {
+		for _, tc := range []struct {
+			name, metadata                 string
+			metadataStatus, downloadStatus int
+			readError                      bool
+		}{
+			{name: "success"},
+			{name: "metadata decode failure", metadata: "{invalid}"},
+			{name: "metadata HTTP failure", metadataStatus: 404},
+			{name: "download HTTP failure", downloadStatus: 403},
+			{name: "download read failure", readError: true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				type contextKey struct{}
+				ctx := context.WithValue(context.Background(), contextKey{}, "marker")
+				metadata := tc.metadata
+				if metadata == "" {
+					metadata = `{"type":"attachment","_links":{"download":"/download/attachments/123/a%20%23%3F.png?version=2&x=one%2Btwo"}}`
+				}
+				metadataBody := &trackingBody{Reader: strings.NewReader(metadata)}
+				downloadBody := &trackingBody{Reader: bytes.NewReader(pngData)}
+				if tc.readError {
+					downloadBody.Reader = iotest.ErrReader(errors.New("image read failed"))
+				}
+				client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "https://example.test/my%20wiki/rest/api", Login: "test-user", Password: "test:password"})
+				calls := 0
+				client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+					calls++
+					login, password, ok := r.BasicAuth()
+					if r.Context().Value(contextKey{}) != "marker" || r.Method != http.MethodGet || !ok || login != "test-user" || password != "test:password" {
+						t.Error("image request lost context/method/Basic authentication")
+					}
+					status, body := http.StatusOK, metadataBody
+					wantURL := "https://example.test/my%20wiki/rest/api/content/att%20%23%3F%25"
+					if calls == 1 {
+						if tc.metadataStatus != 0 {
+							status = tc.metadataStatus
+						}
+					} else {
+						body = downloadBody
+						wantURL = "https://example.test" + downloadPath
+						if tc.downloadStatus != 0 {
+							status = tc.downloadStatus
+						}
+					}
+					if r.URL.String() != wantURL {
+						t.Errorf("escaped image URL changed: %s, want %s", r.URL, wantURL)
+					}
+					return &http.Response{StatusCode: status, Body: body}, nil
+				})
+				data, mimeType, err := client.getImage(ctx, "att #?%")
+				wantError := tc.metadata != "" || tc.metadataStatus != 0 || tc.downloadStatus != 0 || tc.readError
+				if (err != nil) != wantError {
+					t.Fatalf("image transport error: %v", err)
+				}
+				if !wantError && (!bytes.Equal(data, pngData) || mimeType != "image/png") {
+					t.Fatal("getImage changed original image bytes/type")
+				}
+				wantCalls := 2
+				if tc.metadata != "" || tc.metadataStatus != 0 {
+					wantCalls = 1
+				}
+				if calls != wantCalls || !metadataBody.closed || downloadBody.closed != (wantCalls == 2) {
+					t.Fatalf("calls=%d metadata.closed=%v download.closed=%v", calls, metadataBody.closed, downloadBody.closed)
+				}
+			})
+		}
+	})
+	t.Run("download cancellation preserves cause", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		body := &trackingBody{Reader: strings.NewReader(`{"type":"attachment","_links":{"download":"/download/attachments/123/a.png"}}`)}
+		client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "https://example.test/rest/api", Login: "test-user", Password: "test-password"})
+		calls := 0
+		client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			calls++
+			if calls == 1 {
+				cancel()
+				return &http.Response{StatusCode: http.StatusOK, Body: body}, nil
+			}
+			return nil, r.Context().Err()
+		})
+		if _, _, err := client.getImage(ctx, "att123"); !errors.Is(err, context.Canceled) || calls != 2 || !body.closed {
+			t.Fatalf("cancellation lost or metadata body not closed: %v, calls=%d closed=%v", err, calls, body.closed)
+		}
+	})
+}
+
 // TestHandleSearchContent tests searching content via CQL.
 func TestHandleSearchContent(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -331,8 +704,9 @@ func TestHandleSearchContent(t *testing.T) {
 	defer server.Close()
 
 	client := NewConfluenceClient(&ConfluenceConfig{
-		BaseURL: server.URL + "/rest/api",
-		Token:   "test-token",
+		BaseURL:  server.URL + "/rest/api",
+		Login:    "test-user",
+		Password: "test-password",
 	})
 
 	handler := handleSearchContent(client)
@@ -374,8 +748,9 @@ func TestHandleCreateContent(t *testing.T) {
 	defer server.Close()
 
 	client := NewConfluenceClient(&ConfluenceConfig{
-		BaseURL: server.URL + "/rest/api",
-		Token:   "test-token",
+		BaseURL:  server.URL + "/rest/api",
+		Login:    "test-user",
+		Password: "test-password",
 	})
 
 	handler := handleCreateContent(client)
@@ -425,8 +800,9 @@ func TestHandleUpdateContent(t *testing.T) {
 	defer server.Close()
 
 	client := NewConfluenceClient(&ConfluenceConfig{
-		BaseURL: server.URL + "/rest/api",
-		Token:   "test-token",
+		BaseURL:  server.URL + "/rest/api",
+		Login:    "test-user",
+		Password: "test-password",
 	})
 
 	handler := handleUpdateContent(client)
@@ -449,7 +825,7 @@ func TestHandleUpdateContent(t *testing.T) {
 
 // TestHandleSearchContentErrors tests error handling in search.
 func TestHandleSearchContentErrors(t *testing.T) {
-	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://localhost", Token: "t"})
+	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://localhost", Login: "test-user", Password: "test-password"})
 	handler := handleSearchContent(client)
 	ctx := context.Background()
 
@@ -470,7 +846,7 @@ func TestHandleSearchContentErrors(t *testing.T) {
 
 // TestHandleCreateContentErrors tests error handling in create.
 func TestHandleCreateContentErrors(t *testing.T) {
-	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://localhost", Token: "t"})
+	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://localhost", Login: "test-user", Password: "test-password"})
 	handler := handleCreateContent(client)
 	ctx := context.Background()
 
@@ -491,7 +867,7 @@ func TestHandleCreateContentErrors(t *testing.T) {
 
 // TestHandleUpdateContentErrors tests error handling in update.
 func TestHandleUpdateContentErrors(t *testing.T) {
-	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://localhost", Token: "t"})
+	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://localhost", Login: "test-user", Password: "test-password"})
 	handler := handleUpdateContent(client)
 	ctx := context.Background()
 
@@ -525,7 +901,7 @@ func TestExecuteRequestErrors(t *testing.T) {
 	})
 
 	t.Run("invalid body marshal", func(t *testing.T) {
-		client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://localhost", Token: "t"})
+		client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://localhost", Login: "test-user", Password: "test-password"})
 		// Channel cannot be marshaled to JSON
 		_, err := client.executeRequest(ctx, "POST", "/path", nil, make(chan int))
 		if err == nil {
@@ -545,7 +921,7 @@ func TestGetJSONErrors(t *testing.T) {
 		}))
 		defer server.Close()
 
-		client := NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL, Token: "t"})
+		client := NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL, Login: "test-user", Password: "test-password"})
 		var target map[string]any
 		err := client.getJSON(ctx, "/", nil, &target)
 		if err == nil {
@@ -560,7 +936,7 @@ func TestGetJSONErrors(t *testing.T) {
 		}))
 		defer server.Close()
 
-		client := NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL, Token: "t"})
+		client := NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL, Login: "test-user", Password: "test-password"})
 		var target map[string]any
 		err := client.getJSON(ctx, "/", nil, &target)
 		if err == nil || !strings.Contains(err.Error(), "API error") {
@@ -578,7 +954,7 @@ func TestDoRequestAPIError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL, Token: "t"})
+	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL, Login: "test-user", Password: "test-password"})
 	_, err := client.doRequest(ctx, "GET", "/", nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "API error (status 500)") {
 		t.Errorf("expected 500 API error, got %v", err)
@@ -588,8 +964,9 @@ func TestDoRequestAPIError(t *testing.T) {
 // TestLoadConfigMore covers additional paths in loadConfig.
 func TestLoadConfigMore(t *testing.T) {
 	resetConfigEnv(t)
+	t.Setenv("CONFLUENCE_LOGIN", "test-user")
+	t.Setenv("CONFLUENCE_PASS", "test-password")
 	t.Run("valid config with CONFLUENCE_API_BASE_PATH", func(t *testing.T) {
-		t.Setenv("CONFLUENCE_API_TOKEN", "test-token")
 		t.Setenv("CONFLUENCE_API_BASE_PATH", "https://example.com/wiki")
 		config, err := loadConfig()
 		if err != nil {
@@ -601,7 +978,6 @@ func TestLoadConfigMore(t *testing.T) {
 	})
 
 	t.Run("URL without protocol", func(t *testing.T) {
-		t.Setenv("CONFLUENCE_API_TOKEN", "test-token")
 		t.Setenv("CONFLUENCE_BASE_URL", "example.com")
 		config, err := loadConfig()
 		if err != nil {
@@ -623,7 +999,7 @@ func TestHandleCreateContentMore(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL, Token: "t"})
+	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL, Login: "test-user", Password: "test-password"})
 	handler := handleCreateContent(client)
 	ctx := context.Background()
 
@@ -687,7 +1063,7 @@ func TestHandleUpdateContentMore(t *testing.T) {
 		}))
 		defer server.Close()
 
-		client := NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL, Token: "t"})
+		client := NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL, Login: "test-user", Password: "test-password"})
 		handler := handleUpdateContent(client)
 		req := mcp.CallToolRequest{
 			Params: mcp.CallToolParams{
@@ -720,7 +1096,7 @@ func TestHandleUpdateContentMore(t *testing.T) {
 		}))
 		defer server.Close()
 
-		client := NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL, Token: "t"})
+		client := NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL, Login: "test-user", Password: "test-password"})
 		handler := handleUpdateContent(client)
 		req := mcp.CallToolRequest{
 			Params: mcp.CallToolParams{
@@ -741,7 +1117,7 @@ func TestHandleUpdateContentMore(t *testing.T) {
 		}))
 		defer server.Close()
 
-		client := NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL, Token: "t"})
+		client := NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL, Login: "test-user", Password: "test-password"})
 		handler := handleUpdateContent(client)
 		req := mcp.CallToolRequest{
 			Params: mcp.CallToolParams{
@@ -756,7 +1132,7 @@ func TestHandleUpdateContentMore(t *testing.T) {
 	})
 
 	t.Run("invalid contentId format", func(t *testing.T) {
-		client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://localhost", Token: "t"})
+		client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://localhost", Login: "test-user", Password: "test-password"})
 		handler := handleUpdateContent(client)
 		req := mcp.CallToolRequest{
 			Params: mcp.CallToolParams{
@@ -771,7 +1147,7 @@ func TestHandleUpdateContentMore(t *testing.T) {
 	})
 
 	t.Run("getArguments failure", func(t *testing.T) {
-		client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://localhost", Token: "t"})
+		client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://localhost", Login: "test-user", Password: "test-password"})
 		handler := handleUpdateContent(client)
 		req := mcp.CallToolRequest{
 			Params: mcp.CallToolParams{
@@ -801,7 +1177,7 @@ func TestHandleListSpacesMore(t *testing.T) {
 		}))
 		defer server.Close()
 
-		client := NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL, Token: "t"})
+		client := NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL, Login: "test-user", Password: "test-password"})
 		handler := handleListSpaces(client)
 		req := mcp.CallToolRequest{
 			Params: mcp.CallToolParams{
@@ -815,7 +1191,7 @@ func TestHandleListSpacesMore(t *testing.T) {
 	})
 
 	t.Run("getArguments failure", func(t *testing.T) {
-		client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://localhost", Token: "t"})
+		client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://localhost", Login: "test-user", Password: "test-password"})
 		handler := handleListSpaces(client)
 		req := mcp.CallToolRequest{
 			Params: mcp.CallToolParams{
@@ -833,7 +1209,7 @@ func TestHandleListSpacesMore(t *testing.T) {
 // TestHandleGetContentMore covers additional paths in handleGetContent.
 func TestHandleGetContentMore(t *testing.T) {
 	ctx := context.Background()
-	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://localhost", Token: "t"})
+	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://localhost", Login: "test-user", Password: "test-password"})
 	handler := handleGetContent(client)
 
 	t.Run("getArguments failure", func(t *testing.T) {
@@ -853,7 +1229,7 @@ func TestHandleGetContentMore(t *testing.T) {
 // TestHandleSearchContentMore covers additional paths in handleSearchContent.
 func TestHandleSearchContentMore(t *testing.T) {
 	ctx := context.Background()
-	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://localhost", Token: "t"})
+	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://localhost", Login: "test-user", Password: "test-password"})
 	handler := handleSearchContent(client)
 
 	t.Run("getArguments failure", func(t *testing.T) {
@@ -872,7 +1248,7 @@ func TestHandleSearchContentMore(t *testing.T) {
 
 // TestHandleCreateContentMissingArgs covers missing required arguments in handleCreateContent.
 func TestHandleCreateContentMissingArgs(t *testing.T) {
-	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://localhost", Token: "t"})
+	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://localhost", Login: "test-user", Password: "test-password"})
 	handler := handleCreateContent(client)
 	ctx := context.Background()
 
@@ -908,7 +1284,7 @@ func TestTransportErrors(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("executeRequest connection failure", func(t *testing.T) {
-		client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://example.test", Token: "t"})
+		client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://example.test", Login: "test-user", Password: "test-password"})
 		failure := errors.New("connection failure")
 		client.httpClient.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
 			return nil, failure
@@ -920,7 +1296,7 @@ func TestTransportErrors(t *testing.T) {
 	})
 
 	t.Run("doRequest creation failure", func(t *testing.T) {
-		client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://localhost", Token: "t"})
+		client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://localhost", Login: "test-user", Password: "test-password"})
 		// Control characters in method or path can cause NewRequest to fail
 		_, err := client.executeRequest(ctx, "IDK\x7f", "/", nil, nil)
 		if err == nil {
@@ -932,7 +1308,7 @@ func TestTransportErrors(t *testing.T) {
 // TestHandlerAPIErrors covers where handlers receive errors from the client.
 func TestHandlerAPIErrors(t *testing.T) {
 	ctx := context.Background()
-	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://example.test", Token: "t"})
+	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://example.test", Login: "test-user", Password: "test-password"})
 	client.httpClient.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
 		return nil, errors.New("connection failure")
 	})
@@ -993,7 +1369,7 @@ func TestHandleUpdateContentPutError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL, Token: "t"})
+	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL, Login: "test-user", Password: "test-password"})
 	handler := handleUpdateContent(client)
 	req := mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
@@ -1009,13 +1385,14 @@ func TestHandleUpdateContentPutError(t *testing.T) {
 
 // TestSetupServer tests the setupServer function.
 func TestSetupServer(t *testing.T) {
-	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://localhost", Token: "t"})
+	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://localhost", Login: "test-user", Password: "test-password"})
 	s := setupServer(client)
 	if s == nil {
 		t.Fatal("setupServer returned nil")
 	}
 	expected := map[string][]string{
 		"confluence_get_content":    {"contentId", "expand"},
+		"confluence_get_image":      {"attachmentId", "downloadDir"},
 		"confluence_search_content": {"cql", "limit", "start", "expand"},
 		"confluence_create_content": {"title", "spaceKey", "content", "type", "parentId"},
 		"confluence_update_content": {"contentId", "version", "title", "content", "versionComment"},
@@ -1023,6 +1400,7 @@ func TestSetupServer(t *testing.T) {
 	}
 	required := map[string][]string{
 		"confluence_get_content": {"contentId"}, "confluence_search_content": {"cql"},
+		"confluence_get_image":      {"attachmentId"},
 		"confluence_create_content": {"title", "spaceKey", "content"}, "confluence_update_content": {"contentId"},
 	}
 	tools := s.ListTools()
@@ -1088,7 +1466,7 @@ func TestDoRequestReadError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL, Token: "t"})
+	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL, Login: "test-user", Password: "test-password"})
 	_, err := client.doRequest(ctx, "GET", "/", nil, nil)
 	if err == nil {
 		t.Error("expected error for truncated body")
@@ -1099,7 +1477,8 @@ func TestDoRequestReadError(t *testing.T) {
 func TestRun(t *testing.T) {
 	resetConfigEnv(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.URL.Path != "/rest/api/user/current" || r.Header.Get("Authorization") != "Bearer token" {
+		login, password, ok := r.BasicAuth()
+		if r.Method != http.MethodGet || r.URL.Path != "/rest/api/user/current" || !ok || login != "test-user" || password != "test-password" {
 			t.Errorf("bootstrap request: %s %s", r.Method, r.URL)
 			http.Error(w, "invalid request", http.StatusUnauthorized)
 			return
@@ -1108,7 +1487,8 @@ func TestRun(t *testing.T) {
 	}))
 	defer server.Close()
 	t.Run("success", func(t *testing.T) {
-		t.Setenv("CONFLUENCE_API_TOKEN", "token")
+		t.Setenv("CONFLUENCE_LOGIN", "test-user")
+		t.Setenv("CONFLUENCE_PASS", "test-password")
 		t.Setenv("CONFLUENCE_BASE_URL", server.URL)
 		served := false
 		err := run(func(s *mcpserver.MCPServer) error {
@@ -1121,7 +1501,7 @@ func TestRun(t *testing.T) {
 	})
 
 	t.Run("config error", func(t *testing.T) {
-		t.Setenv("CONFLUENCE_API_TOKEN", "") // trigger error
+		t.Setenv("CONFLUENCE_LOGIN", "") // trigger error
 		err := run(func(s *mcpserver.MCPServer) error {
 			return nil
 		})
@@ -1131,7 +1511,8 @@ func TestRun(t *testing.T) {
 	})
 
 	t.Run("serve error", func(t *testing.T) {
-		t.Setenv("CONFLUENCE_API_TOKEN", "token")
+		t.Setenv("CONFLUENCE_LOGIN", "test-user")
+		t.Setenv("CONFLUENCE_PASS", "test-password")
 		t.Setenv("CONFLUENCE_BASE_URL", server.URL)
 		err := run(func(s *mcpserver.MCPServer) error {
 			return fmt.Errorf("serve failed")
@@ -1145,7 +1526,7 @@ func TestRun(t *testing.T) {
 func resetConfigEnv(t *testing.T) {
 	t.Helper()
 	t.Chdir(t.TempDir())
-	for _, name := range []string{"CONFLUENCE_API_TOKEN", "CONFLUENCE_BASE_URL", "CONFLUENCE_API_BASE_PATH", "CONFLUENCE_HOST"} {
+	for _, name := range []string{"CONFLUENCE_LOGIN", "CONFLUENCE_PASS", "CONFLUENCE_API_TOKEN", "CONFLUENCE_BASE_URL", "CONFLUENCE_API_BASE_PATH", "CONFLUENCE_HOST"} {
 		// Register restoration before unsetting: empty ENV must override .env.
 		t.Setenv(name, "")
 		if err := os.Unsetenv(name); err != nil {
@@ -1196,21 +1577,23 @@ func TestLoadConfigServerContract(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			resetConfigEnv(t)
-			t.Setenv("CONFLUENCE_API_TOKEN", "test-token")
+			t.Setenv("CONFLUENCE_LOGIN", "test-user")
+			t.Setenv("CONFLUENCE_PASS", "test-password")
 			t.Setenv("CONFLUENCE_BASE_URL", tc.input)
 			config, err := loadConfig()
 			if tc.want == "" {
 				if err == nil {
 					t.Fatalf("accepted invalid URL: %s", tc.input)
 				}
-			} else if err != nil || config.BaseURL != tc.want || config.Token != "test-token" {
+			} else if err != nil || config.BaseURL != tc.want || config.Login != "test-user" || config.Password != "test-password" {
 				t.Fatalf("config %v, %v; want %s", config, err, tc.want)
 			}
 		})
 	}
 	t.Run("precedence", func(t *testing.T) {
 		resetConfigEnv(t)
-		t.Setenv("CONFLUENCE_API_TOKEN", "test-token")
+		t.Setenv("CONFLUENCE_LOGIN", "test-user")
+		t.Setenv("CONFLUENCE_PASS", "test-password")
 		t.Setenv("CONFLUENCE_BASE_URL", "https://base.test/wiki")
 		t.Setenv("CONFLUENCE_API_BASE_PATH", "https://api.test/wiki")
 		t.Setenv("CONFLUENCE_HOST", "host.test")
@@ -1268,7 +1651,7 @@ func TestReadOptionalIntArgument(t *testing.T) {
 }
 
 func TestHandleValidationBeforeHTTP(t *testing.T) {
-	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://example.test/rest/api", Token: "test"})
+	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://example.test/rest/api", Login: "test-user", Password: "test-password"})
 	calls := 0
 	client.httpClient.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
 		calls++
@@ -1298,6 +1681,16 @@ func TestHandleValidationBeforeHTTP(t *testing.T) {
 			assertToolError(t, result, err)
 		}
 	}
+	for _, args := range []map[string]any{
+		{}, {"attachmentId": ""}, {"attachmentId": 123.0}, {"attachmentId": "123/456"}, {"attachmentId": "..123"},
+		{"attachmentId": "123", "downloadDir": 123.0},
+		{"attachmentId": "123", "downloadDir": "relative"},
+	} {
+		result, err := handleGetImage(client)(context.Background(), mcp.CallToolRequest{Params: mcp.CallToolParams{Arguments: args}})
+		assertToolError(t, result, err)
+	}
+	result, err := handleGetImage(client)(context.Background(), mcp.CallToolRequest{Params: mcp.CallToolParams{Arguments: "invalid"}})
+	assertToolError(t, result, err)
 	if calls != 0 {
 		t.Fatalf("invalid arguments issued %d HTTP calls", calls)
 	}
@@ -1326,7 +1719,7 @@ func TestHandleReadQueries(t *testing.T) {
 				_, _ = w.Write([]byte(tc.response))
 			}))
 			defer server.Close()
-			client := NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL + "/confluence/rest/api", Token: "test"})
+			client := NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL + "/confluence/rest/api", Login: "test-user", Password: "test-password"})
 			result, err := setupServer(client).GetTool(tc.tool).Handler(context.Background(), mcp.CallToolRequest{Params: mcp.CallToolParams{Arguments: tc.args}})
 			assertToolText(t, result, err, tc.response)
 		})
@@ -1354,7 +1747,7 @@ func TestHandleCreateContentPayload(t *testing.T) {
 				args["parentId"] = tc.parent
 				want["ancestors"] = []any{map[string]any{"id": tc.parent}}
 			}
-			client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://example.test/rest/api", Token: "test"})
+			client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://example.test/rest/api", Login: "test-user", Password: "test-password"})
 			calls := 0
 			client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 				calls++
@@ -1451,7 +1844,7 @@ func TestHandleUpdateContentPreservation(t *testing.T) {
 			if !tc.bodyless {
 				want["body"] = map[string]any{"storage": map[string]any{"value": wantBody, "representation": "storage"}}
 			}
-			client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://example.test/rest/api", Token: "test"})
+			client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://example.test/rest/api", Login: "test-user", Password: "test-password"})
 			var methods []string // Controlled transport runs synchronously in the test goroutine.
 			client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 				methods = append(methods, r.Method)
@@ -1508,7 +1901,7 @@ func TestHandleUpdateContentGetFailure(t *testing.T) {
 		{"invalid JSON", `{invalid}`, http.StatusOK},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://example.test/rest/api", Token: "test"})
+			client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://example.test/rest/api", Login: "test-user", Password: "test-password"})
 			calls := 0
 			client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 				calls++
@@ -1529,7 +1922,8 @@ func TestHandleUpdateContentGetFailure(t *testing.T) {
 func (b *trackingBody) Close() error { b.closed = true; return nil }
 
 func TestExecuteRequestContract(t *testing.T) {
-	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "https://example.test/confluence/rest/api", Token: "test-token"})
+	const wantPassword = " \tpassword:with:colons \n"
+	client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "https://example.test/confluence/rest/api", Login: "test-user", Password: wantPassword})
 	if client.httpClient.Timeout != 30*time.Second {
 		t.Fatalf("timeout: %v", client.httpClient.Timeout)
 	}
@@ -1540,7 +1934,8 @@ func TestExecuteRequestContract(t *testing.T) {
 		if r.Method != http.MethodPost || r.URL.String() != "https://example.test/confluence/rest/api/content?expand=space" || r.Context().Value(contextKey{}) != "marker" {
 			t.Errorf("request/context changed: %s %s", r.Method, r.URL)
 		}
-		if r.Header.Get("Authorization") != "Bearer test-token" || r.Header.Get("Content-Type") != "application/json" || r.Header.Get("Accept") != "application/json" {
+		login, password, ok := r.BasicAuth()
+		if !ok || login != "test-user" || password != wantPassword || r.Header.Get("Content-Type") != "application/json" || r.Header.Get("Accept") != "application/json" || r.Header.Get("Cookie") != "" {
 			t.Errorf("headers: %v", r.Header)
 		}
 		data, err := io.ReadAll(r.Body)
@@ -1584,7 +1979,7 @@ func TestResponseBodyClosure(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			body := &trackingBody{Reader: strings.NewReader(tc.payload)}
-			client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://example.test", Token: "test"})
+			client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "http://example.test", Login: "test-user", Password: "test-password"})
 			client.httpClient.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
 				return &http.Response{StatusCode: tc.status, Body: body}, nil
 			})
@@ -1603,24 +1998,26 @@ func TestResponseBodyClosure(t *testing.T) {
 }
 
 func TestLoadConfigDotenv(t *testing.T) {
-	const file = "# Private configuration\nexport CONFLUENCE_API_TOKEN='file-token#=$LITERAL'\nCONFLUENCE_BASE_URL=\"https://file.test/wiki\"\n"
+	const credentials = "export CONFLUENCE_LOGIN='file-user'\nCONFLUENCE_PASS=' file:password#=$LITERAL '\n"
+	const file = "# Private configuration\n" + credentials + "CONFLUENCE_BASE_URL=\"https://file.test/wiki\"\n"
 	for _, tc := range []struct {
-		name, file, wantURL, wantToken, wantError string
-		present                                   bool
-		env                                       map[string]string
+		name, file, wantURL, wantLogin, wantPassword, wantError string
+		present                                                 bool
+		env                                                     map[string]string
 	}{
-		{"file only", file, "https://file.test/wiki/rest/api", "file-token#=$LITERAL", "", true, nil},
-		{"ENV only", "", "https://env.test/rest/api", "env-token", "", false, map[string]string{"CONFLUENCE_API_TOKEN": "env-token", "CONFLUENCE_BASE_URL": "env.test"}},
-		{"missing file and settings", "", "", "", "CONFLUENCE_API_TOKEN", false, nil},
-		{"empty file", "", "https://env.test/rest/api", "env-token", "", true, map[string]string{"CONFLUENCE_API_TOKEN": "env-token", "CONFLUENCE_HOST": "env.test"}},
-		{"ENV wins same keys", file, "http://env.test/context/rest/api", "env-token", "", true, map[string]string{"CONFLUENCE_API_TOKEN": "env-token", "CONFLUENCE_BASE_URL": "http://env.test/context/"}},
-		{"mixed sources", file, "https://file.test/wiki/rest/api", "env-token", "", true, map[string]string{"CONFLUENCE_API_TOKEN": "env-token"}},
-		{"empty ENV token wins", file, "", "", "CONFLUENCE_API_TOKEN", true, map[string]string{"CONFLUENCE_API_TOKEN": ""}},
-		{"alias precedence after merge", file, "https://file.test/wiki/rest/api", "file-token#=$LITERAL", "", true, map[string]string{"CONFLUENCE_HOST": "env.test"}},
-		{"API alias", "CONFLUENCE_API_TOKEN='file-token'\nCONFLUENCE_API_BASE_PATH=https://api.test/wiki/rest/api/\nCONFLUENCE_HOST=host.test\n", "https://api.test/wiki/rest/api", "file-token", "", true, nil},
-		{"empty ENV URL wins then alias", file + "CONFLUENCE_HOST=host.test\n", "https://host.test/rest/api", "file-token#=$LITERAL", "", true, map[string]string{"CONFLUENCE_BASE_URL": ""}},
-		{"invalid dotenv", "CONFLUENCE_API_TOKEN='SECRET_DOTENV_MARKER\n", "", "", "cannot load .env", true, map[string]string{"CONFLUENCE_API_TOKEN": "env-token", "CONFLUENCE_HOST": "env.test"}},
-		{"invalid URL without credentials in error", "CONFLUENCE_API_TOKEN='file-token'\nCONFLUENCE_BASE_URL='https://user:SECRET_DOTENV_MARKER@host.test/%zz'\n", "", "", "invalid base URL", true, nil},
+		{"file only", file, "https://file.test/wiki/rest/api", "file-user", " file:password#=$LITERAL ", "", true, nil},
+		{"ENV only", "", "https://env.test/rest/api", "env-user", "env-password", "", false, map[string]string{"CONFLUENCE_LOGIN": "env-user", "CONFLUENCE_PASS": "env-password", "CONFLUENCE_BASE_URL": "env.test"}},
+		{"missing file and settings", "", "", "", "", "CONFLUENCE_LOGIN", false, nil},
+		{"empty file", "", "https://env.test/rest/api", "env-user", "env-password", "", true, map[string]string{"CONFLUENCE_LOGIN": "env-user", "CONFLUENCE_PASS": "env-password", "CONFLUENCE_HOST": "env.test"}},
+		{"ENV wins same keys", file, "http://env.test/context/rest/api", "env-user", "env-password", "", true, map[string]string{"CONFLUENCE_LOGIN": "env-user", "CONFLUENCE_PASS": "env-password", "CONFLUENCE_BASE_URL": "http://env.test/context/"}},
+		{"mixed sources", file, "https://file.test/wiki/rest/api", "env-user", " file:password#=$LITERAL ", "", true, map[string]string{"CONFLUENCE_LOGIN": "env-user"}},
+		{"empty ENV login wins", file, "", "", "", "CONFLUENCE_LOGIN", true, map[string]string{"CONFLUENCE_LOGIN": ""}},
+		{"empty ENV password wins", file, "", "", "", "CONFLUENCE_PASS", true, map[string]string{"CONFLUENCE_PASS": ""}},
+		{"alias precedence after merge", file, "https://file.test/wiki/rest/api", "file-user", " file:password#=$LITERAL ", "", true, map[string]string{"CONFLUENCE_HOST": "env.test"}},
+		{"API alias", credentials + "CONFLUENCE_API_BASE_PATH=https://api.test/wiki/rest/api/\nCONFLUENCE_HOST=host.test\n", "https://api.test/wiki/rest/api", "file-user", " file:password#=$LITERAL ", "", true, nil},
+		{"empty ENV URL wins then alias", file + "CONFLUENCE_HOST=host.test\n", "https://host.test/rest/api", "file-user", " file:password#=$LITERAL ", "", true, map[string]string{"CONFLUENCE_BASE_URL": ""}},
+		{"invalid dotenv", "CONFLUENCE_PASS='SECRET_DOTENV_MARKER\n", "", "", "", "cannot load .env", true, map[string]string{"CONFLUENCE_LOGIN": "env-user", "CONFLUENCE_PASS": "env-password", "CONFLUENCE_HOST": "env.test"}},
+		{"invalid URL without credentials in error", credentials + "CONFLUENCE_BASE_URL='https://user:SECRET_DOTENV_MARKER@host.test/%zz'\n", "", "", "", "invalid base URL", true, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			resetConfigEnv(t)
@@ -1633,19 +2030,20 @@ func TestLoadConfigDotenv(t *testing.T) {
 				t.Setenv(key, value)
 			}
 			config, err := loadConfig()
+			for _, key := range []string{"CONFLUENCE_LOGIN", "CONFLUENCE_PASS", "CONFLUENCE_API_TOKEN", "CONFLUENCE_BASE_URL", "CONFLUENCE_API_BASE_PATH", "CONFLUENCE_HOST"} {
+				want, supplied := tc.env[key]
+				if got, exists := os.LookupEnv(key); exists != supplied || got != want {
+					t.Fatalf("dotenv mutated process ENV for %s", key)
+				}
+			}
 			if tc.wantError != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.wantError) || strings.Contains(err.Error(), "SECRET_DOTENV_MARKER") {
 					t.Fatalf("configuration error: %v", err)
 				}
 				return
 			}
-			if err != nil || config.BaseURL != tc.wantURL || config.Token != tc.wantToken {
+			if err != nil || config.BaseURL != tc.wantURL || config.Login != tc.wantLogin || config.Password != tc.wantPassword {
 				t.Fatalf("wrong configuration or unexpected error: %v", err)
-			}
-			if _, supplied := tc.env["CONFLUENCE_API_TOKEN"]; !supplied {
-				if _, exists := os.LookupEnv("CONFLUENCE_API_TOKEN"); exists {
-					t.Fatal("dotenv mutated process ENV")
-				}
 			}
 		})
 	}
@@ -1677,7 +2075,7 @@ func TestLoadConfigDotenv(t *testing.T) {
 		if err := os.WriteFile(".env.local", []byte(file), 0600); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := loadConfig(); err == nil || !strings.Contains(err.Error(), "CONFLUENCE_API_TOKEN") {
+		if _, err := loadConfig(); err == nil || !strings.Contains(err.Error(), "CONFLUENCE_LOGIN") {
 			t.Fatalf("loaded parent or .env.local: %v", err)
 		}
 	})
@@ -1702,14 +2100,15 @@ func TestCheckConnection(t *testing.T) {
 		{"unavailable", `SECRET_RESPONSE_MARKER`, "HTTP 503 Service Unavailable", 503},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "https://example.test/confluence/rest/api", Token: "test-token"})
+			client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "https://example.test/confluence/rest/api", Login: "test-user", Password: "test-password"})
 			type contextKey struct{}
 			ctx := context.WithValue(context.Background(), contextKey{}, "marker")
 			body := &trackingBody{Reader: strings.NewReader(tc.payload)}
 			calls := 0
 			client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 				calls++
-				if r.Method != http.MethodGet || r.URL.String() != "https://example.test/confluence/rest/api/user/current" || r.Context().Value(contextKey{}) != "marker" || r.Header.Get("Authorization") != "Bearer test-token" {
+				login, password, ok := r.BasicAuth()
+				if r.Method != http.MethodGet || r.URL.String() != "https://example.test/confluence/rest/api/user/current" || r.Context().Value(contextKey{}) != "marker" || !ok || login != "test-user" || password != "test-password" {
 					t.Errorf("bootstrap request/context/auth mismatch")
 				}
 				return &http.Response{StatusCode: tc.status, Body: body}, nil
@@ -1727,7 +2126,7 @@ func TestCheckConnection(t *testing.T) {
 		})
 	}
 	t.Run("response read error", func(t *testing.T) {
-		client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "https://example.test/rest/api", Token: "test"})
+		client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "https://example.test/rest/api", Login: "test-user", Password: "test-password"})
 		body := &trackingBody{Reader: iotest.ErrReader(errors.New("SECRET_RESPONSE_MARKER"))}
 		client.httpClient.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
 			return &http.Response{StatusCode: 200, Body: body}, nil
@@ -1737,7 +2136,7 @@ func TestCheckConnection(t *testing.T) {
 		}
 	})
 	t.Run("cancellation and transport cause without URL userinfo", func(t *testing.T) {
-		client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "https://SECRET_URL_MARKER@example.test/rest/api", Token: "test"})
+		client := NewConfluenceClient(&ConfluenceConfig{BaseURL: "https://SECRET_URL_MARKER@example.test/rest/api", Login: "test-user", Password: "test-password"})
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		client.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -1761,14 +2160,15 @@ func TestRunDotenvBootstrap(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			resetConfigEnv(t)
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path != "/wiki/rest/api/user/current" || r.Header.Get("Authorization") != "Bearer dotenv-test-token" {
+				login, password, ok := r.BasicAuth()
+				if r.URL.Path != "/wiki/rest/api/user/current" || !ok || login != "dotenv-test-user" || password != "dotenv-test-password" {
 					t.Errorf("wrong bootstrap path/auth")
 				}
 				w.WriteHeader(tc.status)
 				_, _ = w.Write([]byte(tc.payload))
 			}))
 			defer server.Close()
-			file := fmt.Sprintf("CONFLUENCE_API_TOKEN='dotenv-test-token'\nCONFLUENCE_BASE_URL=%s/wiki\n", server.URL)
+			file := fmt.Sprintf("CONFLUENCE_LOGIN='dotenv-test-user'\nCONFLUENCE_PASS='dotenv-test-password'\nCONFLUENCE_BASE_URL=%s/wiki\n", server.URL)
 			if err := os.WriteFile(".env", []byte(file), 0600); err != nil {
 				t.Fatal(err)
 			}
@@ -1785,7 +2185,7 @@ func TestRunDotenvBootstrap(t *testing.T) {
 	}
 	t.Run("invalid dotenv never serves", func(t *testing.T) {
 		resetConfigEnv(t)
-		if err := os.WriteFile(".env", []byte("CONFLUENCE_API_TOKEN='SECRET_DOTENV_MARKER"), 0600); err != nil {
+		if err := os.WriteFile(".env", []byte("CONFLUENCE_PASS='SECRET_DOTENV_MARKER"), 0600); err != nil {
 			t.Fatal(err)
 		}
 		served := false
@@ -1821,7 +2221,8 @@ func TestBinaryBootstrap(t *testing.T) {
 			var calls atomic.Int32
 			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				calls.Add(1)
-				if r.Method != http.MethodGet || r.URL.Path != "/wiki/rest/api/user/current" || r.Header.Get("Authorization") != "Bearer binary-test-token" {
+				login, password, ok := r.BasicAuth()
+				if r.Method != http.MethodGet || r.URL.Path != "/wiki/rest/api/user/current" || !ok || login != "binary-test-user" || password != "binary-test-password" {
 					t.Errorf("installed binary bootstrap path/auth mismatch")
 				}
 				w.WriteHeader(tc.status)
@@ -1832,9 +2233,9 @@ func TestBinaryBootstrap(t *testing.T) {
 				backend.Close()
 			}
 			cwd := t.TempDir()
-			file := fmt.Sprintf("CONFLUENCE_API_TOKEN='binary-test-token'\nCONFLUENCE_BASE_URL=%s/wiki\n", backend.URL)
+			file := fmt.Sprintf("CONFLUENCE_LOGIN='binary-test-user'\nCONFLUENCE_PASS='binary-test-password'\nCONFLUENCE_BASE_URL=%s/wiki\n", backend.URL)
 			if tc.invalidFile {
-				file = "CONFLUENCE_API_TOKEN='SECRET_DOTENV_MARKER"
+				file = "CONFLUENCE_PASS='SECRET_DOTENV_MARKER"
 			}
 			if err := os.WriteFile(filepath.Join(cwd, ".env"), []byte(file), 0600); err != nil {
 				t.Fatal(err)
@@ -1845,7 +2246,7 @@ func TestBinaryBootstrap(t *testing.T) {
 			command.Dir = cwd
 			for _, env := range os.Environ() {
 				key, _, _ := strings.Cut(env, "=")
-				if !slices.Contains([]string{"CONFLUENCE_API_TOKEN", "CONFLUENCE_BASE_URL", "CONFLUENCE_API_BASE_PATH", "CONFLUENCE_HOST"}, key) {
+				if !slices.Contains([]string{"CONFLUENCE_LOGIN", "CONFLUENCE_PASS", "CONFLUENCE_API_TOKEN", "CONFLUENCE_BASE_URL", "CONFLUENCE_API_BASE_PATH", "CONFLUENCE_HOST"}, key) {
 					command.Env = append(command.Env, env)
 				}
 			}
@@ -1859,7 +2260,7 @@ func TestBinaryBootstrap(t *testing.T) {
 				if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 || stdout.Len() != 0 || !strings.Contains(stderr.String(), tc.wantError) {
 					t.Fatalf("startup failure: err=%v stdout=%q stderr=%q", err, stdout.String(), stderr.String())
 				}
-				if strings.Contains(stderr.String(), "SECRET_") || strings.Contains(stderr.String(), "binary-test-token") {
+				if strings.Contains(stderr.String(), "SECRET_") || strings.Contains(stderr.String(), "binary-test-user") || strings.Contains(stderr.String(), "binary-test-password") {
 					t.Fatal("startup leaked credentials or response body")
 				}
 			} else {

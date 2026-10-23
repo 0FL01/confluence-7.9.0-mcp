@@ -1,6 +1,6 @@
 # Confluence MCP
 
-Give your AI agent five tools to read, search, create, and update Confluence content and find spaces. A single Go binary runs locally over MCP stdio and calls your Confluence REST API.
+Give your AI agent six tools to read, search, create, and update Confluence content, find spaces, and retrieve image attachments. A single Go binary runs locally over MCP stdio and calls your Confluence REST API.
 
 **Supported version: Confluence Server 7.9.0, self-hosted only.** Data Center and Cloud are not compatibility targets.
 
@@ -11,27 +11,29 @@ Give your AI agent five tools to read, search, create, and update Confluence con
 | `confluence_create_content` | Create a page or blog post with a storage-format body |
 | `confluence_update_content` | Update content while preserving unchanged fields |
 | `confluence_list_spaces` | List spaces or search their titles |
+| `confluence_get_image` | Return an image attachment or save it to an explicitly chosen server directory |
 
 ## Quick start
 
 ### 1. Prepare a private `.env`
 
-Use a **personal access token from Confluence Server 7.9.0**. The server sends it as `Authorization: Bearer <token>`.
+Use your **Confluence Server 7.9.0 login and password**. All requests use HTTP Basic authentication; personal access tokens and cookies are not used. Use HTTPS in production: Basic authentication does not encrypt credentials by itself.
 
 Create `.env` in a private configuration directory, for example `/absolute/path/to/private/confluence-config/.env`:
 
 ```dotenv
 CONFLUENCE_BASE_URL='https://confluence.example.invalid/confluence'
-CONFLUENCE_API_TOKEN='replace-with-your-server-personal-access-token'
+CONFLUENCE_LOGIN='replace-with-your-login'
+CONFLUENCE_PASS='replace-with-your-password'
 ```
 
-Replace the example URL and token. Include your Confluence context path if applicable. Keep the file out of version control and restrict access, for example on Linux or macOS:
+Replace the example URL, login, and password. Include your Confluence context path if applicable. Keep the file out of version control and restrict access, for example on Linux or macOS:
 
 ```bash
 chmod 600 /absolute/path/to/private/confluence-config/.env
 ```
 
-The server reads `.env` from its **working directory**. Inherited environment variables override the same keys in the file, **including empty values**; an empty inherited token causes startup to fail.
+The server reads `.env` from its **working directory**. Inherited environment variables override the same keys in the file, **including empty values**; an empty inherited login or password causes startup to fail.
 
 ### 2. Install `confluence-mcp`
 
@@ -82,7 +84,7 @@ opencode mcp list
 
 Before starting MCP stdio, the server checks `/rest/api/user/current` and requires HTTP `200` with `type: "known"`. Once connected, ask OpenCode to call `confluence_get_content` with the `contentId` of a page your account can access. This also verifies that account's permission to read the page.
 
-If startup fails, check `cwd`, `.env` readability and syntax, inherited environment overrides, the Confluence URL, and the PAT. Diagnostics go to stderr; stdout is reserved for MCP protocol traffic. See the configuration details below for the full startup contract.
+If startup fails, check `cwd`, `.env` readability and syntax, inherited environment overrides, the Confluence URL, and the login and password. Diagnostics go to stderr; stdout is reserved for MCP protocol traffic. See the configuration details below for the full startup contract.
 
 <details>
 <summary>Prebuilt archives and checksum verification</summary>
@@ -135,13 +137,13 @@ Use the extracted binary's absolute path as the MCP command.
 
 ### Configuration
 
-`CONFLUENCE_API_TOKEN` is required. It must be a **personal access token from Confluence Server 7.9.0**, sent as `Authorization: Bearer <token>`. A Confluence Cloud API token is not the authentication method used here.
+`CONFLUENCE_LOGIN` and `CONFLUENCE_PASS` are required and must be non-empty. The login must not contain a colon (`:`); the password is used unchanged, without trimming. All requests to Confluence, including image downloads, use **HTTP Basic authentication** with these credentials. The legacy `CONFLUENCE_API_TOKEN` is unused: there is no PAT fallback or cookie authentication.
 
 ### `.env` and inherited environment
 
 The server reads only `.env` in its current working directory using `godotenv.Read` from `github.com/joho/godotenv` v1.5.1. It does not search parent directories, the executable directory, or `.env.local`. A missing `.env` permits environment-only configuration; a present but unreadable or malformed file fails startup safely.
 
-File values and the inherited process environment are merged without mutating the process environment. An inherited environment variable overrides the **same key** from `.env`, including when its value is empty. An empty inherited `CONFLUENCE_API_TOKEN`, for example, overrides a file token and fails token validation.
+File values and the inherited process environment are merged without mutating the process environment. An inherited environment variable overrides the **same key** from `.env`, including when its value is empty. An empty inherited `CONFLUENCE_PASS`, for example, overrides a file password and fails credential validation.
 
 Set at least one URL variable. After merging, the first non-empty value wins in this order:
 
@@ -164,7 +166,8 @@ URLs must have a hostname, use `http` or `https`, and contain no query string or
 As an optional alternative to `.env`, set the inherited environment when running from the repository root:
 
 ```bash
-export CONFLUENCE_API_TOKEN='replace-with-your-server-personal-access-token'
+export CONFLUENCE_LOGIN='replace-with-your-login'
+export CONFLUENCE_PASS='replace-with-your-password'
 export CONFLUENCE_BASE_URL='https://confluence.example.invalid/confluence'
 go run .
 ```
@@ -177,7 +180,8 @@ Clients that use the `mcpServers` configuration format, such as Claude Desktop, 
     "confluence": {
       "command": "/absolute/path/confluence-mcp",
       "env": {
-        "CONFLUENCE_API_TOKEN": "replace-with-your-server-personal-access-token",
+        "CONFLUENCE_LOGIN": "replace-with-your-login",
+        "CONFLUENCE_PASS": "replace-with-your-password",
         "CONFLUENCE_BASE_URL": "https://confluence.example.invalid/confluence"
       }
     }
@@ -187,7 +191,7 @@ Clients that use the `mcpServers` configuration format, such as Claude Desktop, 
 
 ### Authenticated startup
 
-After configuration and PAT validation, the server sends `GET /rest/api/user/current` under the configured Confluence context path before starting MCP stdio. It requires HTTP `200` and a JSON user object with `type: "known"`. This request uses the client's 30-second timeout and is not retried.
+After configuration and credential validation, the server sends `GET /rest/api/user/current` under the configured Confluence context path before starting MCP stdio. It requires HTTP `200` and a JSON user object with `type: "known"`. This request uses the client's 30-second timeout and is not retried.
 
 Invalid configuration, an unreadable or malformed `.env`, anonymous users, HTML or invalid JSON responses, non-200 API responses (including `400`, `401`, and `403`), and network failures cause startup to exit with status `1`. Startup diagnostics go to stderr, omit secrets, and never include raw server response bodies; stdout remains reserved for MCP protocol traffic.
 
@@ -200,7 +204,7 @@ This check proves authentication as a known user. Access to individual content a
 
 ### Tool contract
 
-The five tool IDs and their argument names are listed below. Successful calls return the **raw Confluence REST response JSON as MCP text**. Validation and API failures return an MCP tool-error result. Request context is retained, and the HTTP client has a 30-second timeout.
+The six tool IDs and their argument names are listed below. Successful calls to the five content/search/space tools return the **raw Confluence REST response JSON as MCP text**. `confluence_get_image` instead returns native MCP image content with text, or a text-only saved-file result, as described below. Validation and API failures return an MCP tool-error result. Request context is retained, and the HTTP client has a 30-second timeout.
 
 Optional numeric arguments must be finite whole numbers in the REST signed 32-bit integer range. `limit` and `start` accept `0` through `2147483647`; `version` accepts `1` through `2147483647`. Fractional and out-of-range values are rejected. An omitted `limit` defaults to `25`; an explicit `limit: 0` is sent unchanged to Confluence and does not carry a count-only guarantee. Pagination applies only to search and space listing.
 
@@ -282,6 +286,36 @@ This tool returns one result page, including when `searchText` is omitted. Advan
 }
 ```
 
+### `confluence_get_image`
+
+Retrieve an image attachment by its attachment content ID, not its page ID.
+
+**Arguments:**
+- `attachmentId` (string, required): Non-empty attachment ID; IDs containing `/` or `..` are rejected before a request. The ID is escaped as a single URL path segment.
+- `downloadDir` (string, optional): An existing absolute directory on the **MCP server's filesystem**, explicitly chosen by the caller. Omitted or empty values return the image without writing to disk. Relative paths are rejected before any HTTP request.
+
+The tool fetches metadata with `GET /content/{attachmentId}`, requires `type: "attachment"`, and follows `_links.download` only within the configured Confluence origin and site context under `/download/attachments/...`. Redirects are not followed. Downloads are limited to **5 MiB of actual bytes**. PNG, JPEG, GIF, and WebP are identified from the bytes, not trusted metadata. Original bytes are preserved without resizing or conversion.
+
+**Without `downloadDir` (or with `"downloadDir": ""`):** the result contains native MCP image content with the original bytes and accompanying text. No file is created.
+
+**With a non-empty `downloadDir`:** the directory must already exist. It may differ from the server's working directory; directory symlinks are followed using native filesystem behavior. The server does not create directories, fall back to `cwd`, or impose a configured workspace root or sandbox. It uses `os.CreateTemp` to create a unique `confluence-attachment-<id>-<random>.<png|jpeg|gif|webp>` file, with mode `0600` on Unix, without overwriting an existing file. If writing or closing fails, the server attempts to remove the partial file and reports any cleanup error.
+
+The saved-file result is **text only**: a summary instructing the caller to **open the file with a local image reader and delete it when finished**, followed by a JSON array with `id`, `path`, `mimeType`, and `size` (bytes), for example:
+
+```json
+[{"id":"67890","path":"/absolute/path/to/images/confluence-attachment-67890-123456789.png","mimeType":"image/png","size":1024}]
+```
+
+This mode returns no image content, base64, or structured output. Files remain until the caller deletes them.
+
+To discover attachment IDs, use the existing `confluence_search_content` tool with CQL such as:
+
+```json
+{"cql":"type = attachment AND container = 12345"}
+```
+
+Use each attachment's `results[].content.id` as `attachmentId`; paginate search results as needed. There is no separate attachment-listing tool. For example, return an image directly with `{"attachmentId":"67890"}`, or save it with `{"attachmentId":"67890","downloadDir":"/absolute/path/to/images"}`.
+
 </details>
 
 <details>
@@ -299,7 +333,7 @@ go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
 go build -v -o confluence-mcp .
 ```
 
-Configuration tests isolate `CONFLUENCE_API_TOKEN`, `CONFLUENCE_BASE_URL`, `CONFLUENCE_API_BASE_PATH`, and `CONFLUENCE_HOST`; no production credentials are used. The automated tests use local HTTP fixtures to verify client contracts; they do not establish compatibility against a live Confluence installation.
+Configuration tests isolate the working directory and `CONFLUENCE_LOGIN`, `CONFLUENCE_PASS`, `CONFLUENCE_BASE_URL`, `CONFLUENCE_API_BASE_PATH`, `CONFLUENCE_HOST`, and the unused legacy `CONFLUENCE_API_TOKEN` (unset differs from empty); no production credentials are used. Do not run working-directory or environment-mutating tests in parallel. The automated tests use local HTTP fixtures to verify client contracts; they do not establish compatibility against a live Confluence installation.
 
 For local development, run `go run .` from the repository root with a `.env` there or with the environment variables set.
 
@@ -328,7 +362,7 @@ If a failure occurs after the tag is pushed, a tag or draft release may remain. 
 <summary>Confluence API references</summary>
 
 - [Confluence Server REST API 7.9.0](https://docs.atlassian.com/ConfluenceServer/rest/7.9.0/) — pinned REST specification for the target version.
-- [Confluence 7.9 release notes](https://confluence.atlassian.com/doc/confluence-7-9-release-notes-1026537698.html) — Server personal access token support.
+- [Confluence 7.9 release notes](https://confluence.atlassian.com/doc/confluence-7-9-release-notes-1026537698.html).
 - [CQL field reference](https://developer.atlassian.com/server/confluence/cql-field-reference/).
 - [Advanced searching using CQL](https://developer.atlassian.com/server/confluence/advanced-searching-using-cql/).
 
