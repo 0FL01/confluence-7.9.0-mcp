@@ -6,7 +6,7 @@ Give your AI agent six tools to read, search, create, and update Confluence cont
 
 | Tool | What it does |
 | --- | --- |
-| `confluence_get_content` | Retrieve content by ID, including its storage body |
+| `confluence_get_content` | Retrieve content by ID, including its storage body and inline comment threads |
 | `confluence_search_content` | Search content and spaces using CQL |
 | `confluence_create_content` | Create a page or blog post with a storage-format body |
 | `confluence_update_content` | Update content while preserving unchanged fields |
@@ -204,7 +204,7 @@ This check proves authentication as a known user. Access to individual content a
 
 ### Tool contract
 
-The six tool IDs and their argument names are listed below. Successful calls to the five content/search/space tools return the **raw Confluence REST response JSON as MCP text**. `confluence_get_image` instead returns native MCP image content with text, or a text-only saved-file result, as described below. Validation and API failures return an MCP tool-error result. Request context is retained, and the HTTP client has a 30-second timeout.
+The six tool IDs and their argument names are listed below. Successful calls return the **raw Confluence REST response JSON as MCP text**. `confluence_get_content` prepends a text block describing the page's inline comment threads, and `confluence_get_image` instead returns native MCP image content with text, or a text-only saved-file result, as described below. Validation and API failures return an MCP tool-error result. Request context is retained, and the HTTP client has a 30-second timeout.
 
 Optional numeric arguments must be finite whole numbers in the REST signed 32-bit integer range. `limit` and `start` accept `0` through `2147483647`; `version` accepts `1` through `2147483647`. Fractional and out-of-range values are rejected. An omitted `limit` defaults to `25`; an explicit `limit: 0` is sent unchanged to Confluence and does not carry a count-only guarantee. Pagination applies only to search and space listing.
 
@@ -217,6 +217,17 @@ Retrieve content with `GET /content/{contentId}` relative to the configured REST
 - `expand` (string, optional): Comma-separated content expansions, such as `space,version`.
 
 `body.storage` is always included in the expansions, together with any caller-supplied expansions. This request has no pagination parameters.
+
+For `page` and `blogpost` content, the tool then fetches inline comments with `GET /content/{contentId}/child/comment?location=inline&location=resolved&depth=all&expand=body.storage,history,extensions.inlineProperties,extensions.resolution&limit=100&start=N`, following pagination until `_links.next` is absent. Resolved threads and replies are included. If that fetch fails, the call returns a tool error instead of the page alone.
+
+The result contains two text blocks:
+
+1. A comment summary, for example `Inline comments: 3 root threads (resolved included, replies nested).` followed by the comments JSON, or `Inline comments: none (inline and resolved threads checked).` Read it before relying on the page body.
+2. The raw content response JSON, unchanged and still parseable.
+
+Each comment item keeps `extensions.location`, `extensions.inlineProperties.originalSelection` (the quoted text at creation time; it can drift after page edits), `extensions.resolution.status` (`open` or `resolved`), `history` (author and date), and `body.storage.value` (the full text). Replies are nested under `children.comment.results`. Reading a comment or attachment by ID does not fetch comments.
+
+For insight across pages, the existing search tool can select comments directly: `{"cql":"type=comment AND container=245617220","limit":100,"expand":"content.extensions.inlineProperties,content.extensions.resolution"}`. Results are paginated, so advance `start` with `_links.next`.
 
 ### `confluence_search_content`
 

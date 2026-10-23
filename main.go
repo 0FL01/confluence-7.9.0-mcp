@@ -310,6 +310,51 @@ func (c *ConfluenceClient) getImage(ctx context.Context, attachmentID string) ([
 	}
 }
 
+// getInlineComments returns all inline comment threads of content, including resolved threads and their replies.
+func (c *ConfluenceClient) getInlineComments(ctx context.Context, contentID string) ([]json.RawMessage, error) {
+	const pageSize = 100
+	var comments []json.RawMessage
+	start := 0
+	for {
+		var page struct {
+			Results []json.RawMessage `json:"results"`
+			Links   struct {
+				Next string `json:"next"`
+			} `json:"_links"`
+		}
+		query := url.Values{
+			"location": {"inline", "resolved"},
+			"depth":    {"all"},
+			"expand":   {"body.storage,history,extensions.inlineProperties,extensions.resolution"},
+			"limit":    {fmt.Sprintf("%d", pageSize)},
+			"start":    {fmt.Sprintf("%d", start)},
+		}
+		if err := c.getJSON(ctx, "/content/"+contentID+"/child/comment", query, &page); err != nil {
+			return nil, err
+		}
+		comments = append(comments, page.Results...)
+		if page.Links.Next == "" {
+			return comments, nil
+		}
+		if len(page.Results) == 0 {
+			return nil, fmt.Errorf("comment pagination returned an empty page before the end")
+		}
+		start += len(page.Results)
+	}
+}
+
+// inlineCommentsSection states whether the page has discussion and serializes the comment threads.
+func inlineCommentsSection(comments []json.RawMessage) (string, error) {
+	if len(comments) == 0 {
+		return "Inline comments: none (inline and resolved threads checked).", nil
+	}
+	data, err := json.Marshal(comments)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("Inline comments: %d root threads (resolved included, replies nested). Treat them as discussion context before relying on the page: extensions.inlineProperties.originalSelection quotes the marked text, extensions.resolution.status is open or resolved, and body.storage.value holds the full comment.\n\n%s", len(comments), data), nil
+}
+
 // SpaceRef represents a reference to a Confluence space in API responses/requests.
 type SpaceRef struct {
 	Key string `json:"key" `
@@ -455,7 +500,26 @@ func handleGetContent(client *ConfluenceClient) func(context.Context, mcp.CallTo
 			return mcp.NewToolResultError(fmt.Sprintf("error getting content: %v", err)), nil
 		}
 
-		return mcp.NewToolResultText(string(resp)), nil
+		result := mcp.NewToolResultText(string(resp))
+		var content struct {
+			Type string `json:"type"`
+		}
+		_ = json.Unmarshal(resp, &content)
+		if content.Type != "page" && content.Type != "blogpost" {
+			return result, nil
+		}
+
+		comments, err := client.getInlineComments(ctx, contentID)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("error getting inline comments: %v", err)), nil
+		}
+		section, err := inlineCommentsSection(comments)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("error describing inline comments: %v", err)), nil
+		}
+		result.Content = append([]mcp.Content{mcp.NewTextContent(section)}, result.Content...)
+
+		return result, nil
 	}
 }
 
@@ -727,7 +791,7 @@ func setupServer(client *ConfluenceClient) *mcpserver.MCPServer {
 	)
 
 	s.AddTool(mcp.NewTool("confluence_get_content",
-		mcp.WithDescription("Get content by ID from Confluence 7.9.0 Server (selfhosted)"),
+		mcp.WithDescription("Get content by ID from Confluence 7.9.0 Server (selfhosted). Pages and blogposts also return their inline comment threads, resolved threads included, as a preceding text block: read it before relying on the page body."),
 		mcp.WithString("contentId", mcp.Required(), mcp.Description("Confluence content ID")),
 		mcp.WithString("expand", mcp.Description("Comma-separated list of properties to expand")),
 	), handleGetContent(client))
@@ -739,7 +803,7 @@ func setupServer(client *ConfluenceClient) *mcpserver.MCPServer {
 	), handleGetImage(client))
 
 	s.AddTool(mcp.NewTool("confluence_search_content",
-		mcp.WithDescription("Search Confluence 7.9.0 Server (selfhosted) using CQL; returns native SearchResult JSON"),
+		mcp.WithDescription("Search Confluence 7.9.0 Server (selfhosted) using CQL, e.g. type=comment AND container=<pageId> for comments; returns native SearchResult JSON"),
 		mcp.WithString("cql", mcp.Required(), mcp.Description("Confluence Query Language (CQL) search string")),
 		mcp.WithNumber("limit", mcp.Min(0), mcp.Max(maxRESTInt), mcp.MultipleOf(1), mcp.Description("Maximum number of results (default: 25; zero is passed to Confluence)")),
 		mcp.WithNumber("start", mcp.Min(0), mcp.Max(maxRESTInt), mcp.MultipleOf(1), mcp.Description("Zero-based starting index")),

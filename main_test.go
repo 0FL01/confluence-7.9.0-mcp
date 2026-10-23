@@ -301,6 +301,99 @@ func TestHandleGetContent(t *testing.T) {
 	})
 }
 
+// TestHandleGetContentInlineComments verifies page reads return inline discussion too.
+func TestHandleGetContentInlineComments(t *testing.T) {
+	ctx := context.Background()
+	const pageJSON = `{"id":"123","type":"page","title":"P","body":{"storage":{"value":"<p>P</p>","representation":"storage"}}}`
+	const openComment = `{"id":"9","type":"comment","extensions":{"location":"inline","inlineProperties":{"originalSelection":"horizontal","markerRef":"m1"},"resolution":{"status":"open"}},"history":{"createdBy":{"displayName":"Olga"}},"body":{"storage":{"value":"<p>Use the scroll</p>","representation":"storage"}}}`
+	const resolvedComment = `{"id":"10","type":"comment","extensions":{"location":"inline","inlineProperties":{"originalSelection":"centering","markerRef":"m2"},"resolution":{"status":"resolved"}},"body":{"storage":{"value":"<p>No centering</p>","representation":"storage"}}}`
+	const reply = `{"id":"11","type":"comment","extensions":{"location":"inline"},"body":{"storage":{"value":"<p>Reply</p>","representation":"storage"}}}`
+	req := mcp.CallToolRequest{Params: mcp.CallToolParams{Arguments: map[string]any{"contentId": "123"}}}
+
+	newClient := func(t *testing.T, content, comments string, commentsStatus int) *ConfluenceClient {
+		t.Helper()
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case strings.HasSuffix(r.URL.Path, "/child/comment"):
+				if commentsStatus != http.StatusOK {
+					w.WriteHeader(commentsStatus)
+					return
+				}
+				_, _ = w.Write([]byte(comments))
+			case r.URL.Path == "/rest/api/content/123":
+				_, _ = w.Write([]byte(content))
+			default:
+				t.Errorf("unexpected path %s", r.URL.Path)
+			}
+		}))
+		t.Cleanup(server.Close)
+		return NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL + "/rest/api", Login: "test-user", Password: "test-password"})
+	}
+
+	t.Run("all threads across pages", func(t *testing.T) {
+		var starts []string
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/rest/api/content/123" {
+				_, _ = w.Write([]byte(pageJSON))
+				return
+			}
+			query := r.URL.Query()
+			want := url.Values{"location": {"inline", "resolved"}, "depth": {"all"}, "expand": {"body.storage,history,extensions.inlineProperties,extensions.resolution"}, "limit": {"100"}, "start": {query.Get("start")}}
+			if !reflect.DeepEqual(query, want) {
+				t.Errorf("comment query %v, want %v", query, want)
+			}
+			starts = append(starts, query.Get("start"))
+			if query.Get("start") == "0" {
+				_, _ = w.Write([]byte(`{"results":[` + openComment + `,` + resolvedComment + `],"_links":{"next":"/rest/api/content/123/child/comment?start=2"}}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"results":[` + reply + `],"_links":{}}`))
+		}))
+		defer server.Close()
+		client := NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL + "/rest/api", Login: "test-user", Password: "test-password"})
+
+		result, err := handleGetContent(client)(ctx, req)
+		if err != nil || result.IsError || len(result.Content) != 2 {
+			t.Fatalf("expected comment section and page, got %v, %v", result, err)
+		}
+		section := result.Content[0].(mcp.TextContent).Text
+		if !strings.HasPrefix(section, "Inline comments: 3 root threads") ||
+			!strings.Contains(section, `"originalSelection":"horizontal"`) ||
+			!strings.Contains(section, `"status":"resolved"`) ||
+			!strings.Contains(section, "Reply") {
+			t.Errorf("comment section: %s", section)
+		}
+		if page := result.Content[1].(mcp.TextContent).Text; page != pageJSON {
+			t.Errorf("page body changed: %s", page)
+		}
+		if !reflect.DeepEqual(starts, []string{"0", "2"}) {
+			t.Errorf("pagination starts: %v", starts)
+		}
+	})
+
+	t.Run("no comments", func(t *testing.T) {
+		client := newClient(t, pageJSON, `{"results":[]}`, http.StatusOK)
+		result, err := handleGetContent(client)(ctx, req)
+		assertToolTexts(t, result, err, "Inline comments: none (inline and resolved threads checked).", pageJSON)
+	})
+
+	t.Run("comment fetch fails", func(t *testing.T) {
+		client := newClient(t, pageJSON, "boom", http.StatusInternalServerError)
+		result, err := handleGetContent(client)(ctx, req)
+		assertToolError(t, result, err)
+		if !strings.Contains(result.Content[0].(mcp.TextContent).Text, "error getting inline comments") {
+			t.Errorf("unexpected error: %v", result.Content)
+		}
+	})
+
+	t.Run("comment content is not expanded", func(t *testing.T) {
+		const commentJSON = `{"id":"123","type":"comment","body":{"storage":{"value":"<p>C</p>","representation":"storage"}}}`
+		client := newClient(t, commentJSON, "", http.StatusInternalServerError)
+		result, err := handleGetContent(client)(ctx, req)
+		assertToolText(t, result, err, commentJSON)
+	})
+}
+
 // TestHandleListSpaces tests listing and searching spaces.
 func TestHandleListSpaces(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1548,12 +1641,19 @@ func assertToolError(t *testing.T, result *mcp.CallToolResult, err error) {
 
 func assertToolText(t *testing.T, result *mcp.CallToolResult, err error, want string) {
 	t.Helper()
-	if err != nil || result == nil || result.IsError || len(result.Content) != 1 {
+	assertToolTexts(t, result, err, want)
+}
+
+func assertToolTexts(t *testing.T, result *mcp.CallToolResult, err error, want ...string) {
+	t.Helper()
+	if err != nil || result == nil || result.IsError || len(result.Content) != len(want) {
 		t.Fatalf("expected successful text result, got %v, %v", result, err)
 	}
-	text, ok := result.Content[0].(mcp.TextContent)
-	if !ok || text.Text != want {
-		t.Fatalf("response changed: %v, want %q", result.Content, want)
+	for i, expected := range want {
+		text, ok := result.Content[i].(mcp.TextContent)
+		if !ok || text.Text != expected {
+			t.Fatalf("content %d changed: %v, want %q", i, result.Content, expected)
+		}
 	}
 }
 
@@ -1700,19 +1800,25 @@ func TestHandleReadQueries(t *testing.T) {
 	content := `{"id":"123","type":"page","body":{"storage":{"value":"<p>C</p>","representation":"storage"}}}`
 	search := `{"results":[{"content":{"id":"123","type":"page","space":{"key":"TS"},"body":{"storage":{"value":"<p>C</p>","representation":"storage"}}}}],"start":0,"limit":25,"_links":{"next":"/rest/api/search?start=25"}}`
 	spaces := `{"results":[{"space":{"key":"TS","name":"Test","homepage":{"id":"123"}}}],"start":0,"limit":25,"_links":{"base":"http://example.test"}}`
+	noComments := "Inline comments: none (inline and resolved threads checked)."
 	for _, tc := range []struct {
-		name, tool, path, response string
-		args                       map[string]any
-		query                      url.Values
+		name, tool, path, response, comments string
+		args                                 map[string]any
+		query                                url.Values
+		want                                 []string
 	}{
-		{"get expansion", "confluence_get_content", "/content/123", content, map[string]any{"contentId": "123", "expand": "version", "limit": 10.0, "start": 2.0}, url.Values{"expand": {"version,body.storage"}}},
-		{"get no duplicate", "confluence_get_content", "/content/123", content, map[string]any{"contentId": "123", "expand": "body.storage"}, url.Values{"expand": {"body.storage"}}},
-		{"search", "confluence_search_content", "/search", search, map[string]any{"cql": `title ~ "a\\b"`, "expand": "content.body.storage,content.space"}, url.Values{"cql": {`title ~ "a\\b"`}, "limit": {"25"}, "expand": {"content.body.storage,content.space"}}},
-		{"spaces default", "confluence_list_spaces", "/search", spaces, map[string]any{}, url.Values{"cql": {"type=space"}, "limit": {"25"}}},
-		{"space title", "confluence_list_spaces", "/search", spaces, map[string]any{"searchText": `a\"quoted"*`, "limit": 0.0, "start": 2.0, "expand": "space.homepage"}, url.Values{"cql": {`type=space AND title ~ "a\\\"quoted\"*"`}, "limit": {"0"}, "start": {"2"}, "expand": {"space.homepage"}}},
+		{"get expansion", "confluence_get_content", "/content/123", content, `{"results":[]}`, map[string]any{"contentId": "123", "expand": "version", "limit": 10.0, "start": 2.0}, url.Values{"expand": {"version,body.storage"}}, []string{noComments, content}},
+		{"get no duplicate", "confluence_get_content", "/content/123", content, `{"results":[]}`, map[string]any{"contentId": "123", "expand": "body.storage"}, url.Values{"expand": {"body.storage"}}, []string{noComments, content}},
+		{"search", "confluence_search_content", "/search", search, "", map[string]any{"cql": `title ~ "a\\b"`, "expand": "content.body.storage,content.space"}, url.Values{"cql": {`title ~ "a\\b"`}, "limit": {"25"}, "expand": {"content.body.storage,content.space"}}, []string{search}},
+		{"spaces default", "confluence_list_spaces", "/search", spaces, "", map[string]any{}, url.Values{"cql": {"type=space"}, "limit": {"25"}}, []string{spaces}},
+		{"space title", "confluence_list_spaces", "/search", spaces, "", map[string]any{"searchText": `a\"quoted"*`, "limit": 0.0, "start": 2.0, "expand": "space.homepage"}, url.Values{"cql": {`type=space AND title ~ "a\\\"quoted\"*"`}, "limit": {"0"}, "start": {"2"}, "expand": {"space.homepage"}}, []string{spaces}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasSuffix(r.URL.Path, "/child/comment") {
+					_, _ = w.Write([]byte(tc.comments))
+					return
+				}
 				if r.Method != http.MethodGet || r.URL.Path != "/confluence/rest/api"+tc.path || !reflect.DeepEqual(r.URL.Query(), tc.query) {
 					t.Errorf("request %s %s; want GET %s %v", r.Method, r.URL, tc.path, tc.query)
 				}
@@ -1721,7 +1827,7 @@ func TestHandleReadQueries(t *testing.T) {
 			defer server.Close()
 			client := NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL + "/confluence/rest/api", Login: "test-user", Password: "test-password"})
 			result, err := setupServer(client).GetTool(tc.tool).Handler(context.Background(), mcp.CallToolRequest{Params: mcp.CallToolParams{Arguments: tc.args}})
-			assertToolText(t, result, err, tc.response)
+			assertToolTexts(t, result, err, tc.want...)
 		})
 	}
 }
