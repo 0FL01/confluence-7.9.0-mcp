@@ -310,7 +310,7 @@ func (c *ConfluenceClient) getImage(ctx context.Context, attachmentID string) ([
 	}
 }
 
-// getInlineComments returns all inline comment threads of content, including resolved threads and their replies.
+// getInlineComments returns the flat inline/resolved comment list, including replies.
 func (c *ConfluenceClient) getInlineComments(ctx context.Context, contentID string) ([]json.RawMessage, error) {
 	const pageSize = 100
 	var comments []json.RawMessage
@@ -325,7 +325,7 @@ func (c *ConfluenceClient) getInlineComments(ctx context.Context, contentID stri
 		query := url.Values{
 			"location": {"inline", "resolved"},
 			"depth":    {"all"},
-			"expand":   {"body.storage,history,extensions.inlineProperties,extensions.resolution"},
+			"expand":   {"body.storage,history,version,extensions.inlineProperties,extensions.resolution"},
 			"limit":    {fmt.Sprintf("%d", pageSize)},
 			"start":    {fmt.Sprintf("%d", start)},
 		}
@@ -343,16 +343,86 @@ func (c *ConfluenceClient) getInlineComments(ctx context.Context, contentID stri
 	}
 }
 
-// inlineCommentsSection states whether the page has discussion and serializes the comment threads.
-func inlineCommentsSection(comments []json.RawMessage) (string, error) {
-	if len(comments) == 0 {
-		return "Inline comments: none (inline and resolved threads checked).", nil
+// inlineCommentsData groups the complete list, including replies spanning REST pages.
+// This uses observed Server 7.9.0 ordering, not an explicit parent relationship.
+func inlineCommentsData(comments []json.RawMessage, mode string) (map[string]any, error) {
+	type thread struct {
+		Root    any   `json:"root"`
+		Replies []any `json:"replies"`
 	}
-	data, err := json.Marshal(comments)
-	if err != nil {
-		return "", err
+	threads := make([]thread, 0)
+	for _, raw := range comments {
+		var comment struct {
+			ID         string `json:"id"`
+			Extensions struct {
+				InlineProperties struct {
+					OriginalSelection string `json:"originalSelection"`
+					MarkerRef         string `json:"markerRef"`
+				} `json:"inlineProperties"`
+				Resolution struct {
+					Status string `json:"status"`
+				} `json:"resolution"`
+			} `json:"extensions"`
+			History struct {
+				CreatedBy struct {
+					DisplayName string `json:"displayName"`
+				} `json:"createdBy"`
+				CreatedDate string `json:"createdDate"`
+			} `json:"history"`
+			Version struct {
+				Number int `json:"number"`
+				By     struct {
+					DisplayName string `json:"displayName"`
+				} `json:"by"`
+				When string `json:"when"`
+			} `json:"version"`
+			Body struct {
+				Storage struct {
+					Value string `json:"value"`
+				} `json:"storage"`
+			} `json:"body"`
+		}
+		if err := json.Unmarshal(raw, &comment); err != nil {
+			return nil, fmt.Errorf("invalid comment JSON: %w", err)
+		}
+		var item any = raw
+		if mode == "summary" {
+			// Storage often has no newlines; bound the preview even in that case.
+			line, _, _ := strings.Cut(comment.Body.Storage.Value, "\n")
+			preview := []rune(line)
+			if len(preview) > 240 {
+				line = string(preview[:240]) + "…"
+			}
+			item = map[string]any{
+				"id":                comment.ID,
+				"originalSelection": comment.Extensions.InlineProperties.OriginalSelection,
+				"markerRef":         comment.Extensions.InlineProperties.MarkerRef,
+				"status":            comment.Extensions.Resolution.Status,
+				"author":            comment.History.CreatedBy.DisplayName,
+				"createdDate":       comment.History.CreatedDate,
+				"version":           comment.Version.Number,
+				"updatedBy":         comment.Version.By.DisplayName,
+				"updatedDate":       comment.Version.When,
+				"bodyPreview":       line,
+			}
+		}
+		if comment.Extensions.InlineProperties.OriginalSelection != "" {
+			threads = append(threads, thread{Root: item, Replies: make([]any, 0)})
+		} else {
+			if len(threads) == 0 {
+				return nil, fmt.Errorf("inline reply %s has no preceding root; cannot group comments", comment.ID)
+			}
+			last := &threads[len(threads)-1]
+			last.Replies = append(last.Replies, item)
+		}
 	}
-	return fmt.Sprintf("Inline comments: %d root threads (resolved included, replies nested). Treat them as discussion context before relying on the page: extensions.inlineProperties.originalSelection quotes the marked text, extensions.resolution.status is open or resolved, and body.storage.value holds the full comment.\n\n%s", len(comments), data), nil
+	return map[string]any{
+		"mode":                   mode,
+		"footerCommentsIncluded": false,
+		"grouping":               "originalSelection-and-response-order (heuristic)",
+		"counts":                 map[string]int{"threads": len(threads), "comments": len(comments)},
+		"threads":                threads,
+	}, nil
 }
 
 // SpaceRef represents a reference to a Confluence space in API responses/requests.
@@ -492,6 +562,14 @@ func handleGetContent(client *ConfluenceClient) func(context.Context, mcp.CallTo
 			return mcp.NewToolResultError("invalid contentId format"), nil
 		}
 
+		mode := "summary"
+		if raw, present := args["inlineComments"]; present {
+			mode, ok = raw.(string)
+			if !ok || (mode != "none" && mode != "summary" && mode != "full") {
+				return mcp.NewToolResultError("inlineComments must be none, summary or full"), nil
+			}
+		}
+
 		expand, _ := args["expand"].(string)
 		query := url.Values{"expand": {ensureExpand(expand, "body.storage")}}
 
@@ -500,26 +578,45 @@ func handleGetContent(client *ConfluenceClient) func(context.Context, mcp.CallTo
 			return mcp.NewToolResultError(fmt.Sprintf("error getting content: %v", err)), nil
 		}
 
-		result := mcp.NewToolResultText(string(resp))
+		if mode == "none" {
+			return mcp.NewToolResultText(string(resp)), nil
+		}
 		var content struct {
 			Type string `json:"type"`
 		}
-		_ = json.Unmarshal(resp, &content)
+		if err := json.Unmarshal(resp, &content); err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("error decoding content: %v", err)), nil
+		}
 		if content.Type != "page" && content.Type != "blogpost" {
-			return result, nil
+			return mcp.NewToolResultText(string(resp)), nil
 		}
 
 		comments, err := client.getInlineComments(ctx, contentID)
-		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("error getting inline comments: %v", err)), nil
+		var discussion map[string]any
+		if err == nil {
+			discussion, err = inlineCommentsData(comments, mode)
 		}
-		section, err := inlineCommentsSection(comments)
+		if err != nil {
+			discussion = map[string]any{
+				"mode":                   mode,
+				"footerCommentsIncluded": false,
+				"warning":                fmt.Sprintf("Inline comments unavailable: %v", err),
+			}
+		}
+		// Preserve native content fields while returning one parseable JSON object.
+		var response map[string]json.RawMessage
+		if err := json.Unmarshal(resp, &response); err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("error decoding content: %v", err)), nil
+		}
+		response["inlineComments"], err = json.Marshal(discussion)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("error describing inline comments: %v", err)), nil
 		}
-		result.Content = append([]mcp.Content{mcp.NewTextContent(section)}, result.Content...)
-
-		return result, nil
+		data, err := json.Marshal(response)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("error describing content: %v", err)), nil
+		}
+		return mcp.NewToolResultText(string(data)), nil
 	}
 }
 
@@ -791,9 +888,10 @@ func setupServer(client *ConfluenceClient) *mcpserver.MCPServer {
 	)
 
 	s.AddTool(mcp.NewTool("confluence_get_content",
-		mcp.WithDescription("Get content by ID from Confluence 7.9.0 Server (selfhosted). Pages and blogposts also return their inline comment threads, resolved threads included, as a preceding text block: read it before relying on the page body."),
+		mcp.WithDescription("Get content by ID from Confluence 7.9.0 Server (selfhosted). One JSON object; pages/blogposts include inlineComments (resolved included, footer excluded). Read this discussion context before relying on the body; check warning if unavailable. Default summary has bounded previews; use full for complete comments or none to skip. Threads use originalSelection and response order, not explicit parent IDs."),
 		mcp.WithString("contentId", mcp.Required(), mcp.Description("Confluence content ID")),
 		mcp.WithString("expand", mcp.Description("Comma-separated list of properties to expand")),
+		mcp.WithString("inlineComments", mcp.Enum("none", "summary", "full"), mcp.DefaultString("summary"), mcp.Description("Inline/resolved discussion: summary (default), full (raw comments grouped into root/replies), or none (no comment requests). Footer comments are excluded.")),
 	), handleGetContent(client))
 
 	s.AddTool(mcp.NewTool("confluence_get_image",

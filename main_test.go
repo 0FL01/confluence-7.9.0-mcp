@@ -305,9 +305,9 @@ func TestHandleGetContent(t *testing.T) {
 func TestHandleGetContentInlineComments(t *testing.T) {
 	ctx := context.Background()
 	const pageJSON = `{"id":"123","type":"page","title":"P","body":{"storage":{"value":"<p>P</p>","representation":"storage"}}}`
-	const openComment = `{"id":"9","type":"comment","extensions":{"location":"inline","inlineProperties":{"originalSelection":"horizontal","markerRef":"m1"},"resolution":{"status":"open"}},"history":{"createdBy":{"displayName":"Olga"}},"body":{"storage":{"value":"<p>Use the scroll</p>","representation":"storage"}}}`
+	const openComment = `{"id":"9","type":"comment","extensions":{"location":"inline","inlineProperties":{"originalSelection":"horizontal","markerRef":"m1"},"resolution":{"status":"open"}},"history":{"createdBy":{"displayName":"Olga"},"createdDate":"2026-01-01T00:00:00Z"},"version":{"number":2,"by":{"displayName":"Editor"},"when":"2026-02-01T00:00:00Z"},"body":{"storage":{"value":"<p>Use the scroll</p>\n<p>More detail</p>","representation":"storage"}}}`
 	const resolvedComment = `{"id":"10","type":"comment","extensions":{"location":"inline","inlineProperties":{"originalSelection":"centering","markerRef":"m2"},"resolution":{"status":"resolved"}},"body":{"storage":{"value":"<p>No centering</p>","representation":"storage"}}}`
-	const reply = `{"id":"11","type":"comment","extensions":{"location":"inline"},"body":{"storage":{"value":"<p>Reply</p>","representation":"storage"}}}`
+	reply := `{"id":"11","type":"comment","extensions":{"location":"inline","inlineProperties":{"originalSelection":"","markerRef":""}},"body":{"storage":{"value":"` + strings.Repeat("я", 300) + `","representation":"storage"}}}`
 	req := mcp.CallToolRequest{Params: mcp.CallToolParams{Arguments: map[string]any{"contentId": "123"}}}
 
 	newClient := func(t *testing.T, content, comments string, commentsStatus int) *ConfluenceClient {
@@ -315,6 +315,9 @@ func TestHandleGetContentInlineComments(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			switch {
 			case strings.HasSuffix(r.URL.Path, "/child/comment"):
+				if comments == "" {
+					t.Error("unexpected comment request")
+				}
 				if commentsStatus != http.StatusOK {
 					w.WriteHeader(commentsStatus)
 					return
@@ -330,60 +333,155 @@ func TestHandleGetContentInlineComments(t *testing.T) {
 		return NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL + "/rest/api", Login: "test-user", Password: "test-password"})
 	}
 
-	t.Run("all threads across pages", func(t *testing.T) {
-		var starts []string
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/rest/api/content/123" {
-				_, _ = w.Write([]byte(pageJSON))
-				return
-			}
-			query := r.URL.Query()
-			want := url.Values{"location": {"inline", "resolved"}, "depth": {"all"}, "expand": {"body.storage,history,extensions.inlineProperties,extensions.resolution"}, "limit": {"100"}, "start": {query.Get("start")}}
-			if !reflect.DeepEqual(query, want) {
-				t.Errorf("comment query %v, want %v", query, want)
-			}
-			starts = append(starts, query.Get("start"))
-			if query.Get("start") == "0" {
-				_, _ = w.Write([]byte(`{"results":[` + openComment + `,` + resolvedComment + `],"_links":{"next":"/rest/api/content/123/child/comment?start=2"}}`))
-				return
-			}
-			_, _ = w.Write([]byte(`{"results":[` + reply + `],"_links":{}}`))
-		}))
-		defer server.Close()
-		client := NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL + "/rest/api", Login: "test-user", Password: "test-password"})
+	for _, mode := range []string{"summary", "full"} {
+		t.Run("all threads across pages/"+mode, func(t *testing.T) {
+			var starts []string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/rest/api/content/123" {
+					_, _ = w.Write([]byte(pageJSON))
+					return
+				}
+				query := r.URL.Query()
+				want := url.Values{"location": {"inline", "resolved"}, "depth": {"all"}, "expand": {"body.storage,history,version,extensions.inlineProperties,extensions.resolution"}, "limit": {"100"}, "start": {query.Get("start")}}
+				if !reflect.DeepEqual(query, want) {
+					t.Errorf("comment query %v, want %v", query, want)
+				}
+				starts = append(starts, query.Get("start"))
+				if query.Get("start") == "0" {
+					_, _ = w.Write([]byte(`{"results":[` + openComment + `,` + resolvedComment + `],"_links":{"next":"/rest/api/content/123/child/comment?start=2"}}`))
+					return
+				}
+				_, _ = w.Write([]byte(`{"results":[` + reply + `],"_links":{}}`))
+			}))
+			defer server.Close()
+			client := NewConfluenceClient(&ConfluenceConfig{BaseURL: server.URL + "/rest/api", Login: "test-user", Password: "test-password"})
 
-		result, err := handleGetContent(client)(ctx, req)
-		if err != nil || result.IsError || len(result.Content) != 2 {
-			t.Fatalf("expected comment section and page, got %v, %v", result, err)
-		}
-		section := result.Content[0].(mcp.TextContent).Text
-		if !strings.HasPrefix(section, "Inline comments: 3 root threads") ||
-			!strings.Contains(section, `"originalSelection":"horizontal"`) ||
-			!strings.Contains(section, `"status":"resolved"`) ||
-			!strings.Contains(section, "Reply") {
-			t.Errorf("comment section: %s", section)
-		}
-		if page := result.Content[1].(mcp.TextContent).Text; page != pageJSON {
-			t.Errorf("page body changed: %s", page)
-		}
-		if !reflect.DeepEqual(starts, []string{"0", "2"}) {
-			t.Errorf("pagination starts: %v", starts)
-		}
-	})
+			args := map[string]any{"contentId": "123"}
+			if mode == "full" {
+				args["inlineComments"] = mode // summary must also work when omitted.
+			}
+			result, err := handleGetContent(client)(ctx, mcp.CallToolRequest{Params: mcp.CallToolParams{Arguments: args}})
+			if err != nil || result.IsError || len(result.Content) != 1 {
+				t.Fatalf("expected one JSON text block, got %v, %v", result, err)
+			}
+			var got struct {
+				InlineComments struct {
+					Mode                   string         `json:"mode"`
+					FooterCommentsIncluded bool           `json:"footerCommentsIncluded"`
+					Grouping               string         `json:"grouping"`
+					Counts                 map[string]int `json:"counts"`
+					Threads                []struct {
+						Root    map[string]any   `json:"root"`
+						Replies []map[string]any `json:"replies"`
+					} `json:"threads"`
+				} `json:"inlineComments"`
+			}
+			text := result.Content[0].(mcp.TextContent).Text
+			if err := json.Unmarshal([]byte(text), &got); err != nil {
+				t.Fatalf("result is not one JSON object: %v", err)
+			}
+			discussion := got.InlineComments
+			if discussion.Mode != mode || discussion.FooterCommentsIncluded || discussion.Grouping == "" ||
+				!reflect.DeepEqual(discussion.Counts, map[string]int{"threads": 2, "comments": 3}) {
+				t.Errorf("discussion metadata: %+v", discussion)
+			}
+			if len(discussion.Threads) != 2 || len(discussion.Threads[0].Replies) != 0 || len(discussion.Threads[1].Replies) != 1 {
+				t.Fatalf("unexpected thread grouping: %+v", discussion.Threads)
+			}
+			if discussion.Threads[0].Root["id"] != "9" || discussion.Threads[1].Root["id"] != "10" || discussion.Threads[1].Replies[0]["id"] != "11" {
+				t.Errorf("reply attributed to the wrong root: %+v", discussion.Threads)
+			}
+			if mode == "summary" {
+				wantRoot := map[string]any{
+					"id": "9", "originalSelection": "horizontal", "markerRef": "m1", "status": "open",
+					"author": "Olga", "createdDate": "2026-01-01T00:00:00Z", "version": float64(2),
+					"updatedBy": "Editor", "updatedDate": "2026-02-01T00:00:00Z", "bodyPreview": "<p>Use the scroll</p>",
+				}
+				if !reflect.DeepEqual(discussion.Threads[0].Root, wantRoot) || discussion.Threads[1].Root["status"] != "resolved" ||
+					discussion.Threads[1].Replies[0]["bodyPreview"] != strings.Repeat("я", 240)+"…" {
+					t.Errorf("summary fields or bounded preview: %+v", discussion.Threads)
+				}
+			} else {
+				items := []map[string]any{discussion.Threads[0].Root, discussion.Threads[1].Root, discussion.Threads[1].Replies[0]}
+				for i, raw := range []string{openComment, resolvedComment, reply} {
+					var want map[string]any
+					if err := json.Unmarshal([]byte(raw), &want); err != nil {
+						t.Fatal(err)
+					}
+					if !reflect.DeepEqual(items[i], want) {
+						t.Errorf("full comment %d changed: %v", i, items[i])
+					}
+				}
+			}
+			var page, wantPage map[string]any
+			if err := json.Unmarshal([]byte(text), &page); err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal([]byte(pageJSON), &wantPage); err != nil {
+				t.Fatal(err)
+			}
+			delete(page, "inlineComments")
+			if !reflect.DeepEqual(page, wantPage) {
+				t.Errorf("native page fields changed: %v", page)
+			}
+			if !reflect.DeepEqual(starts, []string{"0", "2"}) {
+				t.Errorf("pagination starts: %v", starts)
+			}
+		})
+	}
 
 	t.Run("no comments", func(t *testing.T) {
 		client := newClient(t, pageJSON, `{"results":[]}`, http.StatusOK)
 		result, err := handleGetContent(client)(ctx, req)
-		assertToolTexts(t, result, err, "Inline comments: none (inline and resolved threads checked).", pageJSON)
+		if err != nil || result.IsError || len(result.Content) != 1 {
+			t.Fatalf("expected page with empty discussion: %v, %v", result, err)
+		}
+		var got struct {
+			InlineComments struct {
+				Counts  map[string]int `json:"counts"`
+				Threads []any          `json:"threads"`
+			} `json:"inlineComments"`
+		}
+		if err := json.Unmarshal([]byte(result.Content[0].(mcp.TextContent).Text), &got); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got.InlineComments.Counts, map[string]int{"threads": 0, "comments": 0}) || got.InlineComments.Threads == nil || len(got.InlineComments.Threads) != 0 {
+			t.Errorf("empty discussion: %+v", got)
+		}
 	})
 
-	t.Run("comment fetch fails", func(t *testing.T) {
-		client := newClient(t, pageJSON, "boom", http.StatusInternalServerError)
-		result, err := handleGetContent(client)(ctx, req)
-		assertToolError(t, result, err)
-		if !strings.Contains(result.Content[0].(mcp.TextContent).Text, "error getting inline comments") {
-			t.Errorf("unexpected error: %v", result.Content)
-		}
+	for _, tc := range []struct {
+		name, comments, warning string
+		status                  int
+	}{
+		{"comment fetch fails", "boom", "status 500", http.StatusInternalServerError},
+		{"reply before a root", `{"results":[` + reply + `]}`, "no preceding root", http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := newClient(t, pageJSON, tc.comments, tc.status)
+			result, err := handleGetContent(client)(ctx, req)
+			if err != nil || result.IsError || len(result.Content) != 1 {
+				t.Fatalf("comment failure lost the page: %v, %v", result, err)
+			}
+			var got struct {
+				ConfluencePage
+				InlineComments map[string]any `json:"inlineComments"`
+			}
+			if err := json.Unmarshal([]byte(result.Content[0].(mcp.TextContent).Text), &got); err != nil {
+				t.Fatal(err)
+			}
+			warning, _ := got.InlineComments["warning"].(string)
+			if got.ID != "123" || got.Body.Storage.Value != "<p>P</p>" || !strings.Contains(warning, tc.warning) ||
+				got.InlineComments["counts"] != nil || got.InlineComments["threads"] != nil {
+				t.Errorf("page/warning result: %+v", got)
+			}
+		})
+	}
+
+	t.Run("none skips comment requests", func(t *testing.T) {
+		client := newClient(t, pageJSON, "", http.StatusInternalServerError)
+		result, err := handleGetContent(client)(ctx, mcp.CallToolRequest{Params: mcp.CallToolParams{Arguments: map[string]any{"contentId": "123", "inlineComments": "none"}}})
+		assertToolText(t, result, err, pageJSON)
 	})
 
 	t.Run("comment content is not expanded", func(t *testing.T) {
@@ -1484,7 +1582,7 @@ func TestSetupServer(t *testing.T) {
 		t.Fatal("setupServer returned nil")
 	}
 	expected := map[string][]string{
-		"confluence_get_content":    {"contentId", "expand"},
+		"confluence_get_content":    {"contentId", "expand", "inlineComments"},
 		"confluence_get_image":      {"attachmentId", "downloadDir"},
 		"confluence_search_content": {"cql", "limit", "start", "expand"},
 		"confluence_create_content": {"title", "spaceKey", "content", "type", "parentId"},
@@ -1536,6 +1634,10 @@ func TestSetupServer(t *testing.T) {
 	typeProperty := tools["confluence_create_content"].Tool.InputSchema.Properties["type"].(map[string]any)
 	if !reflect.DeepEqual(typeProperty["enum"], []string{"", "page", "blogpost"}) {
 		t.Errorf("create type enum: %v", typeProperty)
+	}
+	commentsProperty := tools["confluence_get_content"].Tool.InputSchema.Properties["inlineComments"].(map[string]any)
+	if commentsProperty["type"] != "string" || commentsProperty["default"] != "summary" || !reflect.DeepEqual(commentsProperty["enum"], []string{"none", "summary", "full"}) {
+		t.Errorf("inlineComments schema: %v", commentsProperty)
 	}
 	response := s.HandleMessage(context.Background(), json.RawMessage(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}`))
 	rpc, ok := response.(mcp.JSONRPCResponse)
@@ -1781,6 +1883,10 @@ func TestHandleValidationBeforeHTTP(t *testing.T) {
 			assertToolError(t, result, err)
 		}
 	}
+	for _, mode := range []any{"all", true} {
+		result, err := handleGetContent(client)(context.Background(), mcp.CallToolRequest{Params: mcp.CallToolParams{Arguments: map[string]any{"contentId": "123", "inlineComments": mode}}})
+		assertToolError(t, result, err)
+	}
 	for _, args := range []map[string]any{
 		{}, {"attachmentId": ""}, {"attachmentId": 123.0}, {"attachmentId": "123/456"}, {"attachmentId": "..123"},
 		{"attachmentId": "123", "downloadDir": 123.0},
@@ -1800,15 +1906,14 @@ func TestHandleReadQueries(t *testing.T) {
 	content := `{"id":"123","type":"page","body":{"storage":{"value":"<p>C</p>","representation":"storage"}}}`
 	search := `{"results":[{"content":{"id":"123","type":"page","space":{"key":"TS"},"body":{"storage":{"value":"<p>C</p>","representation":"storage"}}}}],"start":0,"limit":25,"_links":{"next":"/rest/api/search?start=25"}}`
 	spaces := `{"results":[{"space":{"key":"TS","name":"Test","homepage":{"id":"123"}}}],"start":0,"limit":25,"_links":{"base":"http://example.test"}}`
-	noComments := "Inline comments: none (inline and resolved threads checked)."
 	for _, tc := range []struct {
 		name, tool, path, response, comments string
 		args                                 map[string]any
 		query                                url.Values
 		want                                 []string
 	}{
-		{"get expansion", "confluence_get_content", "/content/123", content, `{"results":[]}`, map[string]any{"contentId": "123", "expand": "version", "limit": 10.0, "start": 2.0}, url.Values{"expand": {"version,body.storage"}}, []string{noComments, content}},
-		{"get no duplicate", "confluence_get_content", "/content/123", content, `{"results":[]}`, map[string]any{"contentId": "123", "expand": "body.storage"}, url.Values{"expand": {"body.storage"}}, []string{noComments, content}},
+		{"get expansion", "confluence_get_content", "/content/123", content, "", map[string]any{"contentId": "123", "expand": "version", "inlineComments": "none", "limit": 10.0, "start": 2.0}, url.Values{"expand": {"version,body.storage"}}, []string{content}},
+		{"get no duplicate", "confluence_get_content", "/content/123", content, "", map[string]any{"contentId": "123", "expand": "body.storage", "inlineComments": "none"}, url.Values{"expand": {"body.storage"}}, []string{content}},
 		{"search", "confluence_search_content", "/search", search, "", map[string]any{"cql": `title ~ "a\\b"`, "expand": "content.body.storage,content.space"}, url.Values{"cql": {`title ~ "a\\b"`}, "limit": {"25"}, "expand": {"content.body.storage,content.space"}}, []string{search}},
 		{"spaces default", "confluence_list_spaces", "/search", spaces, "", map[string]any{}, url.Values{"cql": {"type=space"}, "limit": {"25"}}, []string{spaces}},
 		{"space title", "confluence_list_spaces", "/search", spaces, "", map[string]any{"searchText": `a\"quoted"*`, "limit": 0.0, "start": 2.0, "expand": "space.homepage"}, url.Values{"cql": {`type=space AND title ~ "a\\\"quoted\"*"`}, "limit": {"0"}, "start": {"2"}, "expand": {"space.homepage"}}, []string{spaces}},
@@ -1816,7 +1921,8 @@ func TestHandleReadQueries(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if strings.HasSuffix(r.URL.Path, "/child/comment") {
-					_, _ = w.Write([]byte(tc.comments))
+					t.Error("unexpected comment request")
+					w.WriteHeader(http.StatusInternalServerError)
 					return
 				}
 				if r.Method != http.MethodGet || r.URL.Path != "/confluence/rest/api"+tc.path || !reflect.DeepEqual(r.URL.Query(), tc.query) {

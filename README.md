@@ -204,7 +204,7 @@ This check proves authentication as a known user. Access to individual content a
 
 ### Tool contract
 
-The six tool IDs and their argument names are listed below. Successful calls return the **raw Confluence REST response JSON as MCP text**. `confluence_get_content` prepends a text block describing the page's inline comment threads, and `confluence_get_image` instead returns native MCP image content with text, or a text-only saved-file result, as described below. Validation and API failures return an MCP tool-error result. Request context is retained, and the HTTP client has a 30-second timeout.
+The six tool IDs and their argument names are listed below. Successful calls return the **Confluence REST response JSON as MCP text**. `confluence_get_content` adds an `inlineComments` field for pages/blogposts by default and returns one JSON text block, without a prose preamble. `confluence_get_image` instead returns native MCP image content with text, or a text-only saved-file result, as described below. Validation and API failures return an MCP tool-error result, except comment-loading failures described below. Request context is retained, and the HTTP client has a 30-second timeout.
 
 Optional numeric arguments must be finite whole numbers in the REST signed 32-bit integer range. `limit` and `start` accept `0` through `2147483647`; `version` accepts `1` through `2147483647`. Fractional and out-of-range values are rejected. An omitted `limit` defaults to `25`; an explicit `limit: 0` is sent unchanged to Confluence and does not carry a count-only guarantee. Pagination applies only to search and space listing.
 
@@ -215,17 +215,38 @@ Retrieve content with `GET /content/{contentId}` relative to the configured REST
 **Arguments:**
 - `contentId` (string, required): Non-empty content ID; IDs containing `/` or `..` are rejected before a request.
 - `expand` (string, optional): Comma-separated content expansions, such as `space,version`.
+- `inlineComments` (string, optional): `summary` (default), `full`, or `none`. Invalid values are rejected before any request.
 
 `body.storage` is always included in the expansions, together with any caller-supplied expansions. This request has no pagination parameters.
 
-For `page` and `blogpost` content, the tool then fetches inline comments with `GET /content/{contentId}/child/comment?location=inline&location=resolved&depth=all&expand=body.storage,history,extensions.inlineProperties,extensions.resolution&limit=100&start=N`, following pagination until `_links.next` is absent. Resolved threads and replies are included. If that fetch fails, the call returns a tool error instead of the page alone.
+For `page` and `blogpost` content (unless `inlineComments: "none"`), the tool fetches comments with `GET /content/{contentId}/child/comment?location=inline&location=resolved&depth=all&expand=body.storage,history,version,extensions.inlineProperties,extensions.resolution&limit=100&start=N`, following pagination until `_links.next` is absent. Resolved threads and replies are included; **footer comments are not included**, explicitly indicated by `footerCommentsIncluded: false`. This is not all page discussion. `summary` reduces MCP output, not the REST data fetched.
 
-The result contains two text blocks:
+The single JSON result retains the native page fields (`id`, `body`, etc.) and adds an `inlineComments` object:
 
-1. A comment summary, for example `Inline comments: 3 root threads (resolved included, replies nested).` followed by the comments JSON, or `Inline comments: none (inline and resolved threads checked).` Read it before relying on the page body.
-2. The raw content response JSON, unchanged and still parseable.
+```json
+{
+  "mode": "summary",
+  "footerCommentsIncluded": false,
+  "grouping": "originalSelection-and-response-order (heuristic)",
+  "counts": {"threads": 2, "comments": 3},
+  "threads": [
+    {"root": {"id": "9"}, "replies": []},
+    {"root": {"id": "10"}, "replies": [{"id": "11"}]}
+  ]
+}
+```
 
-Each comment item keeps `extensions.location`, `extensions.inlineProperties.originalSelection` (the quoted text at creation time; it can drift after page edits), `extensions.resolution.status` (`open` or `resolved`), `history` (author and date), and `body.storage.value` (the full text). Replies are nested under `children.comment.results`. Reading a comment or attachment by ID does not fetch comments.
+The example abbreviates comment fields. Read this discussion context before relying on the page body:
+
+- `summary`: every root and reply includes `id`, `originalSelection`, `markerRef`, `status`, `author`, `createdDate`, `version`, `updatedBy`, `updatedDate`, and `bodyPreview`. The preview is the first line of storage XHTML, capped at 240 Unicode characters plus an ellipsis; it is not the complete comment. Use `full` when the preview is insufficient.
+- `full`: `root` and `replies` retain the complete REST comment objects, including `extensions.inlineProperties`, `extensions.resolution`, `history`, `version` (latest edit), and `body.storage.value`.
+- `none`: no automatic comment requests or added field; the raw content response is returned unchanged. Reading a comment or attachment by ID also skips comment loading.
+
+Confluence's `depth=all` response is flat, not nested under `children.comment.results`. After collecting all REST pages, the tool starts a thread at each nonempty `extensions.inlineProperties.originalSelection` and attaches subsequent quote-less replies to it, including across pagination boundaries. This follows observed Server 7.9.0 ordering, **not a documented parent-ID guarantee**; a changed ordering could misattribute replies. A reply before any root produces a warning rather than a fabricated relationship. No per-root requests are made.
+
+`originalSelection` is the quote at creation time, not a unique/current anchor. Keep `markerRef` when relating a discussion to the body; markers may be missing after edits or occur multiple times. Neither field guarantees an unambiguous current location. `history` records creation; `version` supplies the latest edit metadata, not the complete edit history.
+
+With no comments, `counts` are both zero and `threads` is empty. If comment fetching or grouping fails, the page still succeeds, with `inlineComments.warning` and without `counts`/`threads`; this means discussion is unavailable, **not absent**.
 
 For insight across pages, the existing search tool can select comments directly: `{"cql":"type=comment AND container=245617220","limit":100,"expand":"content.extensions.inlineProperties,content.extensions.resolution"}`. Results are paginated, so advance `start` with `_links.next`.
 

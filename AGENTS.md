@@ -12,7 +12,7 @@ Target: **only Confluence 7.9.0 (server, selfhosted)**. Data Center and Cloud ar
 ## Rules
 - Keep stdout reserved for MCP protocol traffic; diagnostics belong on stderr.
 - When changing the public tool contract, update schemas in `setupServer`, handlers, tests, and README tool descriptions together.
-- Handler validation/API failures use `mcp.NewToolResultError(...), nil`; successes contain response JSON as text except `confluence_get_content`, which prepends an inline-comment text block for `page`/`blogpost`, and `confluence_get_image`: native image + text for omitted/empty `downloadDir`, or text summary + file JSON array only when saving.
+- Handler validation/API failures use `mcp.NewToolResultError(...), nil`; successes contain response JSON as text. Get-content adds `inlineComments` to one JSON object for `page`/`blogpost` (default summary; none skips); comment failures warn without losing the page. Get-image returns native image + text for omitted/empty `downloadDir`, or text summary + file JSON array only when saving.
 - Route REST calls through client helpers to retain request context, HTTP Basic authentication, and the 30-second timeout; close response bodies.
 - `loadConfig` reads only cwd/.env without changing ENV; existing ENV wins per key, including empty values. Invalid/unreadable files fail without exposing input.
 - Require non-empty `CONFLUENCE_LOGIN` and `CONFLUENCE_PASS`; reject colons in login, preserve password unchanged. Legacy `CONFLUENCE_API_TOKEN` is unused; no PAT fallback or cookies.
