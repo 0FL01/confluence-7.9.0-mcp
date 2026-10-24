@@ -264,17 +264,20 @@ Search with `GET /search` using caller-supplied CQL, passed through unchanged.
 
 The response retains Confluence's paginated `SearchResult` shape: content is nested under `results[].content`, and space results are nested under `results[].space`. It is not flattened into a content array. Omitted or `false` `compact` returns the REST response unchanged, including formatting. `compact: true` preserves all other fields and values, including links, excerpts, timestamps, explicitly expanded bodies, pagination, and unknown fields; JSON formatting may change. No text is truncated.
 
-For initial navigation, request `limit: 5` and `compact: true`; the default limit remains `25`. The tool fetches only one result page per call. To retrieve all matches, advance `start` by the returned `size` while `start + size < totalSize`. Confluence can omit `_links.next` even when more results exist; do not use its absence as an end-of-results signal. Use search-specific expansion paths to read nested fields, for example:
+If a page URL/ID is already known, call `confluence_get_content` directly instead of searching. Otherwise, discover pages with `limit: 5`, `compact: true`, and no body expansions, then read the selected pages with `confluence_get_content` for their bodies and inline discussion. This avoids retrieving the same page body in both search and content reads. For initial discovery:
 
 ```json
 {
   "cql": "type=page",
   "limit": 5,
   "start": 0,
-  "compact": true,
-  "expand": "content.body.storage,content.space"
+  "compact": true
 }
 ```
+
+The default limit remains `25`, and the tool fetches only one result page per call. The first five results are not a completeness limit: to retrieve all matches, advance `start` by the returned `size` while `start + size < totalSize`. Confluence can omit `_links.next` even when more results exist; do not use its absence as an end-of-results signal.
+
+When a task specifically needs bodies in search results, `expand: "content.body.storage,content.space"` remains supported and is passed through unchanged. Use search-specific expansion paths for these nested fields.
 
 ### `confluence_create_content`
 

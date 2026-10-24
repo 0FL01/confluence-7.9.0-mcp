@@ -943,11 +943,11 @@ func setupServer(client *ConfluenceClient) *mcpserver.MCPServer {
 	), handleGetImage(client))
 
 	s.AddTool(mcp.NewTool("confluence_search_content",
-		mcp.WithDescription("Search Confluence 7.9.0 Server (selfhosted) using CQL, e.g. type=comment AND container=<pageId> for comments; returns one page of native SearchResult JSON, optionally compacted. For initial navigation use limit=5. Paginate using start/size/totalSize even if _links.next is absent."),
+		mcp.WithDescription("Search Confluence 7.9.0 Server (selfhosted) using CQL, e.g. type=comment AND container=<pageId> for comments; returns one page of native SearchResult JSON, optionally compacted. For known content IDs call confluence_get_content directly. For page discovery use compact=true, limit=5 and no body expansions, then read selected pages with confluence_get_content for body and discussion. Paginate using start/size/totalSize even if _links.next is absent."),
 		mcp.WithString("cql", mcp.Required(), mcp.Description("Confluence Query Language (CQL) search string")),
 		mcp.WithNumber("limit", mcp.Min(0), mcp.Max(maxRESTInt), mcp.MultipleOf(1), mcp.Description("Maximum number of results (default: 25; zero is passed to Confluence)")),
 		mcp.WithNumber("start", mcp.Min(0), mcp.Max(maxRESTInt), mcp.MultipleOf(1), mcp.Description("Zero-based starting index")),
-		mcp.WithString("expand", mcp.Description("Native search expansions, e.g. content.body.storage,content.space")),
+		mcp.WithString("expand", mcp.Description("Native search expansions, e.g. content.space. Omit content.body.storage for page discovery; request it only when search results need bodies")),
 		mcp.WithBoolean("compact", mcp.DefaultBool(false), mcp.Description("Omit only results[].content._expandable, results[].iconCssClass and results[].friendlyLastModified; false returns the unchanged REST response")),
 	), handleSearchContent(client))
 
