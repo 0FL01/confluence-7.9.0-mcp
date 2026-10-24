@@ -37,7 +37,7 @@ The server reads `.env` from its **working directory**. Inherited environment va
 
 ### 2. Install `confluence-mcp`
 
-No release has been published under the [canonical repository](https://github.com/0FL01/confluence-7.9.0-go-mcp) yet. Build from source with **Go 1.25.5**, as specified by `go.mod` and CI:
+Download a prebuilt archive from [Releases](https://github.com/0FL01/confluence-7.9.0-go-mcp/releases) (see the platform table below), or build from source with **Go 1.25.5**, as specified by `go.mod` and CI:
 
 ```bash
 git clone https://github.com/0FL01/confluence-7.9.0-go-mcp.git
@@ -52,7 +52,7 @@ mkdir -p "$HOME/.local/bin"
 install -m 755 confluence-mcp "$HOME/.local/bin/confluence-mcp"
 ```
 
-After the first manual release, you can use the prebuilt archives described below.
+For prebuilt archives, follow the checksum verification instructions below.
 
 ### 3. Configure OpenCode
 
@@ -89,7 +89,7 @@ If startup fails, check `cwd`, `.env` readability and syntax, inherited environm
 <details>
 <summary>Prebuilt archives and checksum verification</summary>
 
-Once a release is available, download the archive for your platform and `checksums.txt` from the [canonical Releases page](https://github.com/0FL01/confluence-7.9.0-go-mcp/releases).
+Download the archive for your platform and `checksums.txt` from the [canonical Releases page](https://github.com/0FL01/confluence-7.9.0-go-mcp/releases).
 
 | Platform | Archive |
 | --- | --- |
@@ -356,7 +356,7 @@ Use each attachment's `results[].content.id` as `attachmentId`; paginate search 
 </details>
 
 <details>
-<summary>Development, CI, and manual releases</summary>
+<summary>Development, CI, and automatic releases</summary>
 
 ### Development
 
@@ -376,22 +376,17 @@ For local development, run `go run .` from the repository root with a `.env` the
 
 ### CI and release builds
 
-Local builds use `go build`. GitHub Actions keeps the Test and Lint gates, validates `.goreleaser.yaml` with `goreleaser check`, and builds all six platforms with `goreleaser release --snapshot --clean`. Snapshot builds do not publish releases.
+Local builds use `go build`. A single GitHub Actions Release workflow runs on pushes to `main`. It compares the entire push (`before` to the pushed SHA); changes only to Markdown (`**/*.md`) skip tests, builds, and publication. All other paths, including workflow and packaging configuration, trigger dependency verification, vet, race-enabled tests, lint, and `goreleaser check` before building all six platforms with `goreleaser release --snapshot --clean`.
 
 GoReleaser v2 builds the root package for Linux, macOS, and Windows on amd64 and arm64, with `CGO_ENABLED=0` and `-s -w`. It packages the archives listed above and generates `checksums.txt`.
 
-### Publish a release manually
+### Automatic publication
 
-The Release workflow runs **only through `workflow_dispatch`**. After pushing the intended changes to `main`:
+After a release-relevant push to `main`, the workflow verifies all six non-empty archives and their SHA-256 checksums, then publishes exactly those archives and `checksums.txt` to GitHub Releases. The GoReleaser snapshot command only builds and packages; publication is a separate step after verification. PRs, tag pushes, and manual dispatches do not trigger this workflow.
 
-1. Open [Actions → Release](https://github.com/0FL01/confluence-7.9.0-go-mcp/actions/workflows/release.yml).
-2. Select **Run workflow** and choose branch **main**.
-3. Enter the required **version**, for example `v1.0.0`.
-4. Select **Run workflow** to publish the release.
+Tags use `release-YYYYMMDD-<12-character SHA>` with the commit's UTC date. Rerunning the same commit updates the same release, not a new version. Release jobs are serialized without cancelling an active publication, and always target the triggering commit rather than the current branch tip.
 
-The version must be stable `vMAJOR.MINOR.PATCH`, with no leading zeros (except the number `0` itself). An existing version fails. The workflow checks the selected `main` commit before creating and pushing a new tag for that SHA, then runs `goreleaser release --clean`. A tag push alone does not trigger publishing.
-
-If a failure occurs after the tag is pushed, a tag or draft release may remain. Resolve that state manually; the workflow does not force-update tags or automatically clean up a failed release.
+See [Actions → Release](https://github.com/0FL01/confluence-7.9.0-go-mcp/actions/workflows/release.yml) for checks and publication logs. Release notes contain the commit range, compare link, and exact asset list. A failed upload can leave a partial release; rerun the failed workflow after resolving the cause.
 
 </details>
 

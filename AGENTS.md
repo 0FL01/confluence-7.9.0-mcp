@@ -7,7 +7,7 @@ Target: **only Confluence 7.9.0 (server, selfhosted)**. Data Center and Cloud ar
 - `main.go`: `ConfluenceClient.executeRequest`, `doRequest`, and `getJSON` own REST transport and response handling; `getImage` owns bounded attachment downloads.
 - `main_test.go`: handler/client tests with `httptest`; `TestRun` injects a serve function without starting stdio.
 - `.goreleaser.yaml`: six-platform builds, archives and checksums shared by CI snapshots and releases.
-- `.github/workflows/`: CI tests/lint/snapshots and manual-only Release (new version on main); local builds use `go build`, no script.
+- `.github/workflows/release.yml`: push to main → tests/lint/six-platform packaging → verified automatic Release; Markdown-only pushes skip publication. Local builds use `go build`, no script.
 
 ## Rules
 - Keep stdout reserved for MCP protocol traffic; diagnostics belong on stderr.
