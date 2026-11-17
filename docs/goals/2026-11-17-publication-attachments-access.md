@@ -1,6 +1,6 @@
 # Goal: Publication attachments and access controls for Confluence 7.9.0
 
-Status: blocked
+Status: complete
 Source: user publication specification (sections 1–6 and exclusions), approved RECON plan, and instruction to implement iteratively, commit/push, build and replace the executable in PATH.
 Last updated: 2026-11-17
 
@@ -47,8 +47,8 @@ Complete the frozen Required Outcomes using the listed Change Envelope and Prima
   - Source: specification §6 and explicit external-write boundary.
   - Acceptance: on an agreed test page, upload PNG/JSONL and read metadata, reject duplicate without changing existing version, explicitly update to a new version, embed ri:attachment and check rendering in an authorized browser, verify ACL preservation/dry run/readback. Never use the ML homepage or publish the real case.
   - Primary evidence: agreed-page integration observations and authorized-browser visual check.
-  - Status: blocked
-  - Evidence: no test parent/page or test ACL subjects have been approved. RECON performed read-only operations only. Implementation/local verification can proceed; external writes cannot.
+  - Status: verified
+  - Evidence: installed binary passed live acceptance under the user-approved parent using a new current-user-only read-restricted container and synthetic child. PNG/JSONL uploads matched native metadata and downloaded bytes; duplicate filename preserved bytes/version; explicit attachment-ID update advanced exactly one version and changed bytes. Default dry run preserved both ACLs; granular group add/remove for both read/update preserved the current user and other operation with complete readback. Unconfirmed last removal was blocked; explicit removal remained protected by the container's inherited read ACL. Own/ancestor sources were separate and complete. Storage ri:attachment references survived readback; isolated authenticated Chromium loaded a 96x64 PNG and its element screenshot was visually verified (green/purple fixture with white diagonal). All two created attachments and two pages were deleted with ordinary DELETE, each followed by GET 404. Existing parent version and restrictions were unchanged. No credentials, private bodies, subject names or exported browser session state were included in logs/evidence artifacts.
 - R7: Commit and push intended implementation and documentation.
   - Source: latest user instruction.
   - Acceptance: intended changes committed and pushed to origin/main, excluding pre-existing user .gitignore changes, credentials and generated files.
@@ -65,7 +65,7 @@ Complete the frozen Required Outcomes using the listed Change Envelope and Prima
 ### Constraints
 - Confluence Server exactly 7.9.0; no Cloud/DC compatibility assumptions. Preserve Basic Auth, context paths, request cancellation, 30-second HTTP timeout and stdout reserved for MCP.
 - Existing .env is private and must not be edited, copied into artifacts, printed, or committed. Private responses remain in memory; probes print only non-sensitive structure/status.
-- No external mutations without an agreed test destination and subjects. User authorized code publication and local binary replacement, not publication of MARKETING-449 or changes to space rights.
+- External mutations are limited to the newly approved temporary subtree, current-user/existing-group fixture ACLs and synthetic files; delete created pages after tests. Never modify the approved existing parent or space rights, publish the real case, or grant effective access outside the self-read-restricted container.
 - No automatic write replay or redirect following. Safe error handling must not emit raw server error bodies.
 - Existing image-download 5 MiB policy is not an attachment-upload size limit. Do not invent the server's configured upload limit or misclassify its ambiguous 404 responses.
 - Granular restriction API lacks a demonstrated transaction/CAS: read-before-write and readback do not guarantee atomicity against another administrator. State this limitation; do not claim a local lock solves it.
@@ -96,27 +96,26 @@ Complete the frozen Required Outcomes using the listed Change Envelope and Prima
 - SpacePermissionSubjectType 7.9.0 includes USER, GROUP, ANONYMOUS and ALL_AUTHENTICATED_USERS; legacy RPC special-subject serialization remains unproven.
 
 ## Current Checkpoint
-- Closes: R6 external acceptance only.
-- Smallest next action: obtain explicit approved test parent/page and test users/groups, then perform the synthetic PNG/JSONL and granular-ACL acceptance sequence; verify rendering in an authorized browser.
-- Expected evidence: duplicate preserves attachment/version, explicit update adds a version, granular assignment preserves others, readback matches and embedded PNG renders.
-- Stop or replan if: destination/subjects are not approved. Do not use the production homepage or real case as a substitute.
+- None: all required outcomes resolved; no further implementation or testing is authorized by this goal.
 
 ## Current State
-- Resolved: R1–R5 and R7/R8; implementation is published and installed.
-- Last relevant evidence: full Go 1.25.5 race/vet, zero-issue lint and affected tests passed; implementation diff reviewed; GitHub Release successful; installed read-only smoke passed.
-- Blocker: R6 needs agreed test location/subjects and authorized-browser validation. No authorized write experiment remains; local fixtures and read-only probes cannot prove actual upload/update/rendering behavior.
-- Next: wait for the smallest unlock (approved location and subjects), not further speculative runtime changes. Restart the consuming MCP client/process to pick up the replaced executable.
+- Resolved: R1–R8. Published/installed runtime 94489e0 required no fixes after live acceptance.
+- Last relevant evidence: all sixteen live checks passed using the installed binary, native readback/download verification and authenticated Chromium; fixture screenshot visually reviewed; deletion of all four owned objects verified by GET 404.
+- Blocker: none. Anonymous RPC special-subject uncertainty and nontransactional ACL semantics remain documented product limitations, not claims of effective access.
+- Next: stop. Ordinary content deletion was used; no permanent space-trash purge or unrelated content/permission change was performed.
 
 ## Material Decisions
 - 2026-11-17: user approved implementation, commit/push and replacement of current PATH binary. Existing unrelated .gitignore modification excluded.
 - 2026-11-17: use only narrow built-in legacy RPC reads and experimental granular ACL writes proven present in 7.9.0; no Cloud endpoint substitution.
+- 2026-11-17: user authorized creating temporary test content under a specified existing page and deleting it afterwards. Use a self-read-restricted container to keep group/last-removal ACL tests from widening effective access; no mutation of the existing parent.
 
 ## Checkpoint History
 - 2026-11-17: frozen original specification and approved plan after successful read-only RECON; external write acceptance explicitly blocked, not waived.
 - 2026-11-17: implemented four tools without dependencies; reviewed runtime/contract diff. Full Go 1.25.5 race tests and vet passed. Existing CI lint found test-only style issues, corrected; lint and affected tests now pass. No private server mutations.
 - 2026-11-17: pushed 94489e0; GitHub Release run 44096841379 succeeded. Built clean published source, atomically replaced existing PATH binary and verified installed read-only space/restriction/dry-run behavior. Only R6 remains blocked by missing authorization for a test location/subjects and visual acceptance.
+- 2026-11-17: user approved a test parent and cleanup. Sixteen live checks passed: isolated setup/ancestor reads, default dry run, granular read/update preservation and readback, last-removal guard/confirmation, streamed PNG/JSONL/native metadata/downloads, duplicate nonmutation, explicit version update, Storage references, authenticated Chromium rendering, and unchanged original parent. Two fixture pages and two attachments deleted; all four current-content GETs returned 404. No runtime changes or rebuild needed.
 
 ## Completion
-- Closure comparison: R1–R5/R7/R8 verified; R6 blocked, not waived. Overall status blocked, not complete.
-- Delivery scope remains four tools, necessary safe transport changes, tests and current docs; no dependency/workflow/.env/user .gitignore changes. No Confluence mutations or case publication occurred.
-- Installed runtime is implementation commit 94489e0; this final evidence record does not change runtime source and requires no rebuild.
+- Closure comparison passed: R1–R8 verified with current evidence. Final status complete; no pending/blocked outcomes.
+- Delivery scope remains four tools, necessary safe transport changes, tests and current docs; no dependency/workflow/.env/user .gitignore changes. External writes affected only the disposable synthetic subtree; original parent version/ACL unchanged, no case publication or space-permission changes.
+- Installed runtime is implementation commit 94489e0; this final evidence record changes no runtime source and requires no rebuild. Original Go/CI gates remain applicable; live acceptance succeeded without runtime edits. Test artifacts/session state were not committed; no permanent trash purge was attempted.
