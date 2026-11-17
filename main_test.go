@@ -1675,17 +1675,25 @@ func TestSetupServer(t *testing.T) {
 		t.Fatal("setupServer returned nil")
 	}
 	expected := map[string][]string{
-		"confluence_get_content":    {"contentId", "expand", "inlineComments"},
-		"confluence_get_image":      {"attachmentId", "downloadDir"},
-		"confluence_search_content": {"cql", "limit", "start", "expand", "compact"},
-		"confluence_create_content": {"title", "spaceKey", "content", "type", "parentId"},
-		"confluence_update_content": {"contentId", "version", "title", "content", "versionComment"},
-		"confluence_list_spaces":    {"searchText", "limit", "start", "expand"},
+		"confluence_get_content":         {"contentId", "expand", "inlineComments"},
+		"confluence_get_image":           {"attachmentId", "downloadDir"},
+		"confluence_search_content":      {"cql", "limit", "start", "expand", "compact"},
+		"confluence_create_content":      {"title", "spaceKey", "content", "type", "parentId"},
+		"confluence_update_content":      {"contentId", "version", "title", "content", "versionComment"},
+		"confluence_list_spaces":         {"searchText", "limit", "start", "expand"},
+		"confluence_upload_attachment":   {"contentId", "filePath", "fileName", "comment", "attachmentId"},
+		"confluence_get_space":           {"spaceKey", "includePermissions"},
+		"confluence_get_restrictions":    {"contentId", "includeAncestors"},
+		"confluence_update_restrictions": {"contentId", "operation", "addUsers", "removeUsers", "addGroups", "removeGroups", "dryRun", "confirmRemoveLastRestriction"},
 	}
 	required := map[string][]string{
 		"confluence_get_content": {"contentId"}, "confluence_search_content": {"cql"},
 		"confluence_get_image":      {"attachmentId"},
 		"confluence_create_content": {"title", "spaceKey", "content"}, "confluence_update_content": {"contentId"},
+		"confluence_upload_attachment":   {"contentId", "filePath"},
+		"confluence_get_space":           {"spaceKey"},
+		"confluence_get_restrictions":    {"contentId"},
+		"confluence_update_restrictions": {"contentId", "operation"},
 	}
 	tools := s.ListTools()
 	if len(tools) != len(expected) {
@@ -1735,6 +1743,16 @@ func TestSetupServer(t *testing.T) {
 	compactProperty := tools["confluence_search_content"].Tool.InputSchema.Properties["compact"].(map[string]any)
 	if compactProperty["type"] != "boolean" || compactProperty["default"] != false {
 		t.Errorf("compact schema: %v", compactProperty)
+	}
+	updateProperties := tools["confluence_update_restrictions"].Tool.InputSchema.Properties
+	for name, want := range map[string]bool{"dryRun": true, "confirmRemoveLastRestriction": false} {
+		property := updateProperties[name].(map[string]any)
+		if property["type"] != "boolean" || property["default"] != want {
+			t.Errorf("%s default: %v", name, property)
+		}
+	}
+	if !reflect.DeepEqual(updateProperties["operation"].(map[string]any)["enum"], []string{"read", "update"}) {
+		t.Error("restriction operation enum changed")
 	}
 	response := s.HandleMessage(context.Background(), json.RawMessage(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}`))
 	rpc, ok := response.(mcp.JSONRPCResponse)

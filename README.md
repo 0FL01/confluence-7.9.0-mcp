@@ -1,6 +1,6 @@
 # Confluence MCP
 
-Give your AI agent six tools to read, search, create, and update Confluence content, find spaces, and retrieve image attachments. A single Go binary runs locally over MCP stdio and calls your Confluence REST API.
+Give your AI agent ten tools to read, search, create, and update Confluence content, upload attachments, and inspect or change page restrictions. A single Go binary runs locally over MCP stdio and calls Confluence REST APIs, plus two read-only legacy JSON-RPC methods for space permissions.
 
 **Supported version: Confluence Server 7.9.0, self-hosted only.** Data Center and Cloud are not compatibility targets.
 
@@ -12,6 +12,10 @@ Give your AI agent six tools to read, search, create, and update Confluence cont
 | `confluence_update_content` | Update content while preserving unchanged fields |
 | `confluence_list_spaces` | List spaces or search their titles |
 | `confluence_get_image` | Return an image attachment or save it to an explicitly chosen server directory |
+| `confluence_upload_attachment` | Stream a local file as a new attachment, or explicitly update an attachment by ID |
+| `confluence_get_space` | Read space metadata and optionally permission assignments and current-user permissions |
+| `confluence_get_restrictions` | Read own page restrictions and optionally ancestor read restrictions |
+| `confluence_update_restrictions` | Preview or apply granular page restriction changes, with readback |
 
 ## Quick start
 
@@ -204,9 +208,9 @@ This check proves authentication as a known user. Access to individual content a
 
 ### Tool contract
 
-The six tool IDs and their argument names are listed below. Successful calls return the **Confluence REST response JSON as MCP text**. `confluence_get_content` adds an `inlineComments` field for pages/blogposts by default and returns one JSON text block, without a prose preamble. `confluence_search_content` can omit three service fields with `compact: true`; its default response is unchanged. `confluence_get_image` instead returns native MCP image content with text, or a text-only saved-file result, as described below. Validation and API failures return an MCP tool-error result, except comment-loading failures described below. Request context is retained, and the HTTP client has a 30-second timeout.
+The ten tool IDs and their argument names are listed below. Existing content/search/create/update/list calls return **Confluence response JSON as MCP text**. `confluence_get_content` adds an `inlineComments` field for pages/blogposts by default and returns one JSON text block, without a prose preamble. `confluence_search_content` can omit three service fields with `compact: true`; its default response is unchanged. `confluence_get_image` instead returns native MCP image content with text, or a text-only saved-file result. Upload and access tools return their documented JSON summaries. Validation and API failures return an MCP tool-error result, except partial read results with explicit completeness/warnings described below. Request context is retained, and the HTTP client has a 30-second timeout per request. Redirects are not followed; write operations are not automatically retried. HTTP errors expose status and a safe explanation, never raw server error bodies.
 
-Optional numeric arguments must be finite whole numbers in the REST signed 32-bit integer range. `limit` and `start` accept `0` through `2147483647`; `version` accepts `1` through `2147483647`. Fractional and out-of-range values are rejected. An omitted `limit` defaults to `25`; an explicit `limit: 0` is sent unchanged to Confluence and does not carry a count-only guarantee. Pagination applies only to search and space listing.
+Optional numeric arguments must be finite whole numbers in the REST signed 32-bit integer range. `limit` and `start` accept `0` through `2147483647`; `version` accepts `1` through `2147483647`. Fractional and out-of-range values are rejected. An omitted `limit` defaults to `25`; an explicit `limit: 0` is sent unchanged to Confluence and does not carry a count-only guarantee. Caller-controlled pagination applies to search and space listing; restriction subjects are paginated internally to completion.
 
 ### `confluence_get_content`
 
@@ -356,6 +360,80 @@ To discover attachment IDs, use the existing `confluence_search_content` tool wi
 
 Use each attachment's `results[].content.id` as `attachmentId`; paginate search results as needed. There is no separate attachment-listing tool. For example, return an image directly with `{"attachmentId":"67890"}`, or save it with `{"attachmentId":"67890","downloadDir":"/absolute/path/to/images"}`.
 
+### `confluence_upload_attachment`
+
+**Arguments:**
+- `contentId` (string, required): Destination page ID.
+- `filePath` (string, required): Absolute path to a readable regular file on the MCP server filesystem.
+- `fileName` (string, optional): Attachment basename; defaults to `basename(filePath)`. No path separators, CR/LF or NUL.
+- `comment` (string, optional): Attachment version comment.
+- `attachmentId` (string, optional): Existing attachment ID **only for explicit updates**. Empty IDs/names and invalid argument types are rejected.
+
+Files are streamed as multipart field `file` with `X-Atlassian-Token: nocheck`; file bytes are not returned to the LLM. PNG, Markdown, JSON and JSONL have explicit MIME mappings; other regular files use extension/sniffed MIME. The image-download 5 MiB cap does not apply to uploads; Confluence and its proxy enforce their configured upload limits.
+
+Creation checks the filename, then calls `POST /rest/api/content/{contentId}/child/attachment?allowDuplicated=false`. An existing filename is a conflict, never an implicit update. With `attachmentId`, the tool verifies the attachment's ID/type/container/version and filename conflicts before `POST /rest/api/content/{contentId}/child/attachment/{attachmentId}/data`. This creates a new attachment version. Both routes are documented in Server 7.9.0.
+
+The JSON result has `attachmentId`, `contentId`, `fileName`, `mediaType`, `fileSize` (bytes), `version` and `downloadUrl` resolved from the Confluence link. Missing metadata is fetched with GET, never by replaying POST. A network failure, truncated response or failed metadata verification can occur **after the write took effect**: inspect attachment metadata before attempting another upload. The tool reports this uncertainty instead of claiming that no attachment was written.
+
+Errors distinguish missing/unreadable local files, filename conflicts, permission failures, HTTP 413 size limits and HTTP 415 unsupported media. Server 7.9.0 can also report upload limits as 404; a 404 is deliberately described as ambiguous rather than incorrectly diagnosed.
+
+### `confluence_get_space`
+
+**Arguments:**
+- `spaceKey` (string, required): Space key.
+- `includePermissions` (boolean, optional): Defaults to `false`; set `true` for publication access checks.
+
+Metadata (`id`, `key`, `name`, `type`, `homepage`) comes from `GET /rest/api/space/{spaceKey}?expand=homepage`. Server 7.9.0 does not provide the needed assignments through `expand=permissions,operations`. When requested, the tool makes two **read-only** JSON-RPC calls to `/rpc/json-rpc/confluenceservice-v2`, using existing Basic Auth:
+- `getSpacePermissionSets(spaceKey)` for assignments;
+- `getPermissions(spaceKey)` for the authenticated caller's space-permission names.
+
+These reads use HTTP POST, not permission-changing methods. JSON-RPC errors inside HTTP 200 are checked. `permissions` and `currentUserOperations` include independent `status`, `complete` and `source` fields. Statuses distinguish `ok`, confirmed `empty`, `not_requested`, `forbidden`, `unauthenticated`, `unsupported`, `unavailable`, `unknown` and `error`; unavailable data is never a successful empty grant list. Partial reads retain space metadata and return warnings.
+
+`permissions.assignments` contains `type` (the server permission name), `userName` or `groupName`, and `subjectType`. `assignmentsComplete` reports whether the returned assignment sets were fully decoded. **`anonymousAccess` remains `unknown` and permission completeness remains false:** 7.9.0 distinguishes anonymous and all-authenticated subjects, but legacy RPC's special-subject encoding has not been verified. An entry with neither username nor group is retained as an unknown subject, not relabelled anonymous. Even an empty returned list is not proof that anonymous access is disabled. Overall `complete` covers requested data; requesting permissions currently makes it false because of this unresolved component.
+
+These are assignments and caller permission names, not an effective-access calculation. Global access, group membership and page/ancestor restrictions remain separate checks. Never infer “employees only” from missing fields.
+
+### `confluence_get_restrictions`
+
+**Arguments:**
+- `contentId` (string, required): Page ID.
+- `includeAncestors` (boolean, optional): Defaults to `false`; set `true` for publication access checks.
+
+Reads own `read` and `update` through `/rest/api/content/{id}/restriction/byOperation/{operation}`. User and group lists are paginated until both are exhausted, using returned pagination metadata, **not `_links.next`**: Server 7.9.0 can omit next links while more subjects remain.
+
+The result separates own restrictions from each ancestor's **read** restrictions and includes source page IDs/titles, completeness and warnings. Missing/inaccessible data is incomplete, not an empty ACL. Ancestor update restrictions are not treated as inherited restrictions. Empty own read restrictions do not make a page public: space permissions and ancestor read restrictions still apply. No effective-permission or nested-group calculation is performed.
+
+Response fields are `own.{source,read,update}`, `ancestors.{requested,status,complete,sources,warnings}`, overall `complete`, `warnings` and `interpretation`. Each ACL has `users`, `groups`, `complete` and `warnings`; unrequested ancestors are explicitly marked `not-requested`.
+
+### `confluence_update_restrictions`
+
+**Arguments:**
+- `contentId` (string, required): Page ID.
+- `operation` (string, required): `read` or `update`; only this operation is changed.
+- `addUsers`, `removeUsers` (string arrays, optional): Stable Confluence **user keys**, not display names.
+- `addGroups`, `removeGroups` (string arrays, optional): Group names.
+- `dryRun` (boolean, optional): **Defaults to `true`**. Explicit `false` is required to write.
+- `confirmRemoveLastRestriction` (boolean, optional): Defaults to `false`; explicit confirmation is required when removing the final user/group of the selected operation, potentially broadening access.
+
+The tool reads the complete current ACL, rejects contradictory deltas, ignores already-satisfied changes, and previews the actual additions/removals. Writes use only singular PUT/DELETE routes under `/rest/experimental/content/{id}/restriction/byOperation/{operation}/user?key=...` and `/group/{groupName}`. These routes exist in Server 7.9.0; stable `/rest/api` write routes from newer products must not be substituted. The full collection is never replaced, unrelated assignments and the other operation are preserved, and space permissions are never changed. Additions precede removals.
+
+After writing, the tool rereads restrictions and returns actual state and action outcomes. A partial failure, ambiguous network outcome or failed readback is an MCP tool error with structured details, **not a generic success**. It stops further writes and does not automatically retry or roll back.
+
+The response includes `actions`, `noops`, `preflight`, `readback`, `readbackStatus`, `confirmationRequired`, `warnings` and `concurrency`. Actions distinguish `confirmed`, `failed`, `unknown` and `not-attempted`; `readbackMatches` separately records the observed final state where available. A dry run needing last-removal confirmation still returns its preview with `confirmationRequired: true`; actual execution without confirmation fails.
+
+**Concurrency boundary:** these APIs offer no demonstrated transaction/CAS for the ACL. Preflight, last-removal checks and readback cannot eliminate a race with another administrator. Avoid concurrent ACL edits during publication. Removing the caller's access can prevent readback; this is reported as unverified, not success.
+
+### Safe publication sequence
+
+1. Call `confluence_get_space` with `includePermissions: true` and `confluence_get_restrictions` on the agreed parent with `includeAncestors: true`. Resolve relevant unknowns with an authorized administrator; do not treat incomplete evidence as approval.
+2. Create a page under that parent with a neutral title and empty Storage body `<p></p>`.
+3. If needed, preview, apply and verify page `read` restrictions before sending sensitive material.
+4. Only then update the body and upload attachments. Markdown-to-Storage conversion belongs to the caller, not this MCP.
+5. Reread the body/attachment metadata and restrictions. Embed an uploaded image by its actual filename, for example `<ac:image><ri:attachment ri:filename="figure.png" /></ac:image>` (XML-escape dynamic filenames).
+6. Verify rendering in an authorized browser: API success does not prove correct display.
+
+Do not first publish sensitive text with broad access and restrict it afterwards. External write tests require an explicitly agreed test location and ACL subjects, not a production space homepage. Local HTTP fixtures and read-only probes do not substitute for this write/rendering acceptance.
+
 </details>
 
 <details>
@@ -397,6 +475,8 @@ See [Actions → Release](https://github.com/0FL01/confluence-7.9.0-go-mcp/actio
 <summary>Confluence API references</summary>
 
 - [Confluence Server REST API 7.9.0](https://docs.atlassian.com/ConfluenceServer/rest/7.9.0/) — pinned REST specification for the target version.
+- [Confluence JSON-RPC APIs](https://developer.atlassian.com/server/confluence/confluence-json-rpc-apis/) and [7.9.0 RPC interface](https://docs.atlassian.com/ConfluenceServer/javadoc/7.9.0/com/atlassian/confluence/rpc/soap/ConfluenceSoapService.html) — legacy space-permission reads.
+- [Experimental content restrictions, 7.9.0](https://docs.atlassian.com/ConfluenceServer/javadoc/7.9.0/com/atlassian/confluence/plugins/restapi/experimental/resources/ExperimentalContentRestrictionsResource.html) — singular restriction changes.
 - [Confluence 7.9 release notes](https://confluence.atlassian.com/doc/confluence-7-9-release-notes-1026537698.html).
 - [CQL field reference](https://developer.atlassian.com/server/confluence/cql-field-reference/).
 - [Advanced searching using CQL](https://developer.atlassian.com/server/confluence/advanced-searching-using-cql/).

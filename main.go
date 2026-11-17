@@ -158,15 +158,9 @@ func (c *ConfluenceClient) checkConnection(ctx context.Context) error {
 func (c *ConfluenceClient) executeRequest(ctx context.Context, method, path string, query url.Values, body any) (*http.Response, error) {
 	u, err := url.Parse(c.config.BaseURL)
 	if err != nil {
-		return nil, fmt.Errorf("invalid base URL: %w", err)
+		return nil, fmt.Errorf("invalid base URL")
 	}
-
 	u = u.JoinPath(path)
-
-	if len(query) > 0 {
-		u.RawQuery = query.Encode()
-	}
-
 	var reqBody io.Reader
 	if body != nil {
 		jsonBytes, err := json.Marshal(body)
@@ -175,22 +169,80 @@ func (c *ConfluenceClient) executeRequest(ctx context.Context, method, path stri
 		}
 		reqBody = bytes.NewBuffer(jsonBytes)
 	}
+	return c.sendRequest(ctx, method, u, query, reqBody, nil)
+}
 
-	req, err := http.NewRequestWithContext(ctx, method, u.String(), reqBody)
+// executeSiteRequest uses a fixed site-relative API route, retaining a configured
+// context path. It supports the multipart and legacy APIs outside /rest/api.
+func (c *ConfluenceClient) executeSiteRequest(ctx context.Context, method, sitePath string, query url.Values, body io.Reader, headers http.Header) (*http.Response, error) {
+	u, err := url.Parse(c.config.BaseURL)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return nil, fmt.Errorf("invalid base URL")
 	}
+	u.Path = strings.TrimSuffix(strings.TrimRight(u.Path, "/"), "/rest/api")
+	if u.RawPath != "" {
+		u.RawPath = strings.TrimSuffix(strings.TrimRight(u.RawPath, "/"), "/rest/api")
+	}
+	return c.sendRequest(ctx, method, u.JoinPath(sitePath), query, body, headers)
+}
 
-	req.SetBasicAuth(c.config.Login, c.config.Password)
+func (c *ConfluenceClient) sendRequest(ctx context.Context, method string, u *url.URL, query url.Values, body io.Reader, headers http.Header) (*http.Response, error) {
+	u.RawQuery = query.Encode()
+	u.User = nil
+	u.Fragment = ""
+
+	req, err := http.NewRequestWithContext(ctx, method, u.String(), body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create HTTP request")
+	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	for key, values := range headers {
+		req.Header[key] = append([]string(nil), values...)
+	}
+	req.SetBasicAuth(c.config.Login, c.config.Password)
 
-	resp, err := c.httpClient.Do(req)
+	// Never replay writes or forward credentials/data to a redirect target.
+	httpClient := *c.httpClient
+	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := httpClient.Do(req)
 	if err != nil {
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) {
+			err = urlErr.Err
+		}
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
 
 	return resp, nil
+}
+
+type apiStatusError struct {
+	StatusCode int
+}
+
+func (e *apiStatusError) Error() string {
+	reason := http.StatusText(e.StatusCode)
+	switch e.StatusCode {
+	case http.StatusUnauthorized:
+		reason = "authentication required or rejected"
+	case http.StatusForbidden:
+		reason = "permission denied or operation disabled"
+	case http.StatusNotFound:
+		reason = "not found or not accessible; attachment uploads may also exceed the server size limit"
+	case http.StatusConflict:
+		reason = "conflict with existing content or version"
+	case http.StatusRequestEntityTooLarge:
+		reason = "file or request exceeds the server size limit"
+	case http.StatusUnsupportedMediaType:
+		reason = "unsupported format or media type"
+	}
+	return fmt.Sprintf("API error (status %d): %s", e.StatusCode, reason)
+}
+
+// Never expose an HTTP error body: proxies and plugins can echo sensitive input.
+func responseStatusError(resp *http.Response) error {
+	return &apiStatusError{StatusCode: resp.StatusCode}
 }
 
 // doRequest performs an authenticated HTTP request and returns the body as bytes.
@@ -203,14 +255,13 @@ func (c *ConfluenceClient) doRequest(ctx context.Context, method, path string, q
 	defer func() {
 		_ = resp.Body.Close()
 	}()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, responseStatusError(resp)
+	}
 
 	respBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(respBytes))
 	}
 
 	return respBytes, nil
@@ -226,9 +277,8 @@ func (c *ConfluenceClient) getJSON(ctx context.Context, path string, query url.V
 		_ = resp.Body.Close()
 	}()
 
-	if resp.StatusCode >= 400 {
-		respBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(respBytes))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return responseStatusError(resp)
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(target); err != nil {
@@ -976,6 +1026,39 @@ func setupServer(client *ConfluenceClient) *mcpserver.MCPServer {
 		mcp.WithNumber("start", mcp.Min(0), mcp.Max(maxRESTInt), mcp.MultipleOf(1), mcp.Description("Zero-based starting index")),
 		mcp.WithString("expand", mcp.Description("Native search expansions, e.g. space.homepage")),
 	), handleListSpaces(client))
+
+	s.AddTool(mcp.NewTool("confluence_upload_attachment",
+		mcp.WithDescription("Upload a local file to Confluence 7.9.0 Server (selfhosted) as a streamed attachment. Create-only by default: duplicate filenames conflict. Explicit attachmentId updates only an attachment belonging to contentId. No automatic write retry; reconcile an unknown outcome before retrying. Check space/ancestor access and set/verify page read restrictions before uploading sensitive files."),
+		mcp.WithString("contentId", mcp.Required(), mcp.Description("Target page ID")),
+		mcp.WithString("filePath", mcp.Required(), mcp.Description("Absolute readable regular file path on the MCP server")),
+		mcp.WithString("fileName", mcp.Description("Attachment filename; omitted defaults to basename(filePath)")),
+		mcp.WithString("comment", mcp.Description("Optional attachment version comment")),
+		mcp.WithString("attachmentId", mcp.Description("Existing attachment ID, only for an explicit new-version update")),
+	), handleUploadAttachment(client))
+
+	s.AddTool(mcp.NewTool("confluence_get_space",
+		mcp.WithDescription("Read space metadata from Confluence 7.9.0 Server (selfhosted). includePermissions uses read-only legacy JSON-RPC with existing Basic Auth for assignments and current-user permissions. Check status, complete and warnings: unavailable fields are not empty grants, and anonymous access may remain unknown. Does not calculate effective access or expand group membership."),
+		mcp.WithString("spaceKey", mcp.Required(), mcp.Description("Confluence space key")),
+		mcp.WithBoolean("includePermissions", mcp.DefaultBool(false), mcp.Description("Read space assignments and current-user permissions; required for publication access checks")),
+	), handleGetSpace(client))
+
+	s.AddTool(mcp.NewTool("confluence_get_restrictions",
+		mcp.WithDescription("Read page restrictions from Confluence 7.9.0 Server (selfhosted), fully paging users/groups. Own read/update and ancestor read restrictions are separate with page sources and completeness. Empty own restrictions do not mean public access; inspect space permissions too. Enable includeAncestors before publication."),
+		mcp.WithString("contentId", mcp.Required(), mcp.Description("Page ID")),
+		mcp.WithBoolean("includeAncestors", mcp.DefaultBool(false), mcp.Description("Include each ancestor's read restrictions, not inherited update restrictions")),
+	), handleGetRestrictions(client))
+
+	s.AddTool(mcp.NewTool("confluence_update_restrictions",
+		mcp.WithDescription("Change individual page restrictions in Confluence 7.9.0 Server (selfhosted). dryRun=true by default. Uses granular experimental API; never replaces the full ACL or changes space permissions. Last removal needs explicit confirmation. Returns readback and partial/unknown outcomes; no transaction/CAS guarantee against concurrent administrators. Set and verify read restrictions before publishing sensitive content."),
+		mcp.WithString("contentId", mcp.Required(), mcp.Description("Page ID")),
+		mcp.WithString("operation", mcp.Required(), mcp.Enum("read", "update"), mcp.Description("Only this restriction operation is changed")),
+		mcp.WithArray("addUsers", mcp.WithStringItems(), mcp.Description("Stable Confluence user keys to add")),
+		mcp.WithArray("removeUsers", mcp.WithStringItems(), mcp.Description("Stable Confluence user keys to remove")),
+		mcp.WithArray("addGroups", mcp.WithStringItems(), mcp.Description("Group names to add")),
+		mcp.WithArray("removeGroups", mcp.WithStringItems(), mcp.Description("Group names to remove")),
+		mcp.WithBoolean("dryRun", mcp.DefaultBool(true), mcp.Description("Preview only unless explicitly false")),
+		mcp.WithBoolean("confirmRemoveLastRestriction", mcp.DefaultBool(false), mcp.Description("Explicitly allow removing the last user/group of the selected operation, which may broaden access")),
+	), handleUpdateRestrictions(client))
 
 	return s
 }

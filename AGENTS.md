@@ -4,7 +4,8 @@ Target: **only Confluence 7.9.0 (server, selfhosted)**. Data Center and Cloud ar
 
 ## Map
 - `main.go`: `run`/`main` bootstrap, `loadConfig` configuration, `setupServer` tool schemas, and `handle*` handlers.
-- `main.go`: `ConfluenceClient.executeRequest`, `doRequest`, and `getJSON` own REST transport and response handling; `getImage` owns bounded attachment downloads.
+- `main.go`: `executeRequest`/`executeSiteRequest` share `sendRequest` (Basic Auth/context/no redirects); `doRequest`/`getJSON` own safe response handling; `getImage` owns bounded downloads.
+- `attachments.go`, `space.go`, `restrictions.go`: upload and access tools, with adjacent `*_test.go`; schemas stay in `setupServer`.
 - `main_test.go`: handler/client tests with `httptest`; `TestRun` injects a serve function without starting stdio.
 - `.goreleaser.yaml`: six-platform builds, archives and checksums shared by CI snapshots and releases.
 - `.github/workflows/release.yml`: push to main → tests/lint/six-platform packaging → verified automatic Release; Markdown-only pushes skip publication. Local builds use `go build`, no script.
@@ -14,6 +15,9 @@ Target: **only Confluence 7.9.0 (server, selfhosted)**. Data Center and Cloud ar
 - When changing the public tool contract, update schemas in `setupServer`, handlers, tests, and README tool descriptions together.
 - Handler validation/API failures use `mcp.NewToolResultError(...), nil`; successes contain response JSON as text. Get-content adds `inlineComments` to one JSON object for `page`/`blogpost` (default summary; none skips); comment failures warn without losing the page. Get-image returns native image + text for omitted/empty `downloadDir`, or text summary + file JSON array only when saving.
 - Route REST calls through client helpers to retain request context, HTTP Basic authentication, and the 30-second timeout; close response bodies.
+- Uploads stream multipart with `allowDuplicated=false`; explicit updates verify the attachment container. No write retries or raw HTTP/RPC error bodies; ambiguous outcomes require reconciliation, not replay.
+- Space permissions use two read-only legacy RPC methods, not REST expands. Keep unavailable/empty distinct and anonymous special-subject semantics unknown. Restrictions paginate users/groups without relying on next links.
+- Restriction writes use singular experimental routes only, dry-run by default, explicit last-removal confirmation and readback/partial outcomes. No atomicity against concurrent administrators; see README for publication order.
 - `loadConfig` reads only cwd/.env without changing ENV; existing ENV wins per key, including empty values. Invalid/unreadable files fail without exposing input.
 - Require non-empty `CONFLUENCE_LOGIN` and `CONFLUENCE_PASS`; reject colons in login, preserve password unchanged. Legacy `CONFLUENCE_API_TOKEN` is unused; no PAT fallback or cookies.
 - `run` requires `/user/current` HTTP 200 with type `known` before MCP stdio; startup errors expose status/cause, never credentials or raw response bodies.
