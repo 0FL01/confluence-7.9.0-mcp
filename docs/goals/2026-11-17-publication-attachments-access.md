@@ -1,6 +1,6 @@
 # Goal: Publication attachments and access controls for Confluence 7.9.0
 
-Status: active
+Status: blocked
 Source: user publication specification (sections 1–6 and exclusions), approved RECON plan, and instruction to implement iteratively, commit/push, build and replace the executable in PATH.
 Last updated: 2026-11-17
 
@@ -23,8 +23,8 @@ Complete the frozen Required Outcomes using the listed Change Envelope and Prima
   - Source: specification §2.
   - Acceptance: space ID/key/name/type/homepage, caller permissions if available, user/group assignments, honest anonymous-access status, completeness and warnings; distinguish empty, forbidden, unsupported, unrequested and unknown/error. Never infer deny-all or employees-only from absent fields; no nested-group effective-permission engine.
   - Primary evidence: space REST and legacy JSON-RPC fixtures plus read-only installed-tool smoke.
-  - Status: in_progress
-  - Evidence: fixtures passed for context-preserving Basic Auth, metadata-only mode, assignments/special subjects, empty/forbidden/unsupported/missing results and no raw RPC error disclosure. Installed-tool smoke remains after delivery.
+  - Status: verified
+  - Evidence: fixtures passed for context-preserving Basic Auth, metadata-only mode, assignments/special subjects, empty/forbidden/unsupported/missing results and no raw RPC error disclosure. Installed MCP returned successful assignment/caller-permission reads, assignmentsComplete=true, anonymousAccess=unknown and complete=false as documented; no private response content was printed or stored.
 - R3: `confluence_get_restrictions(contentId, includeAncestors?)`.
   - Source: specification §3.
   - Acceptance: own read/update subjects, fully paginated users/groups, separately sourced ancestor read restrictions with page IDs/titles, completeness and warnings. No claim that empty own ACL means public; no inherited update interpretation.
@@ -53,14 +53,14 @@ Complete the frozen Required Outcomes using the listed Change Envelope and Prima
   - Source: latest user instruction.
   - Acceptance: intended changes committed and pushed to origin/main, excluding pre-existing user .gitignore changes, credentials and generated files.
   - Primary evidence: commit/push and matching remote SHA; required CI results where applicable.
-  - Status: pending
-  - Evidence:
+  - Status: verified
+  - Evidence: implementation 94489e0c6a0429a0dd0960d80de479c7bd50ceff pushed to origin/main, remote SHA matched. GitHub Release run 44096841379 completed successfully: https://github.com/0FL01/confluence-7.9.0-mcp/actions/runs/44096841379 . GitHub redirects the existing origin to the renamed repository; configuration was not changed. This delivery record is a subsequent docs-only update; unrelated .gitignore remains uncommitted.
 - R8: Build and replace the existing executable in PATH.
   - Source: latest user instruction.
   - Acceptance: Go 1.25.5 build from published implementation installed atomically at /home/stfu/.local/bin/confluence-mcp, executable, matching build bytes; installed MCP schemas and read-only new tools verified without exposing private results.
   - Primary evidence: build metadata/checksum and installed-binary smoke.
-  - Status: pending
-  - Evidence:
+  - Status: verified
+  - Evidence: clean detached worktree of 94489e0 built with GOTOOLCHAIN=go1.25.5 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w'; build metadata confirms Go 1.25.5 linux/amd64. Atomically installed at /home/stfu/.local/bin/confluence-mcp, mode 0755, cmp matched build bytes. SHA-256: 0abfb8d69c5ee8ff55668778ba25ede8a188d5b0caa05c5983d472a5a0f64009. Installed stdio MCP smoke passed initialization, ten-tool schema/defaults, space permissions, own read/update and a nonempty ancestor read chain, and default dry run with an unapplied synthetic addition. No live writes. Prior executable retained at /home/stfu/.cache/opencode-tmp/opencode/confluence-mcp-before-94489e0; temporary clean worktree removed.
 
 ### Constraints
 - Confluence Server exactly 7.9.0; no Cloud/DC compatibility assumptions. Preserve Basic Auth, context paths, request cancellation, 30-second HTTP timeout and stdout reserved for MCP.
@@ -96,16 +96,16 @@ Complete the frozen Required Outcomes using the listed Change Envelope and Prima
 - SpacePermissionSubjectType 7.9.0 includes USER, GROUP, ANONYMOUS and ALL_AUTHENTICATED_USERS; legacy RPC special-subject serialization remains unproven.
 
 ## Current Checkpoint
-- Closes: R2 installed smoke and R7/R8 delivery.
-- Smallest next action: commit/push the reviewed files, build published source with Go 1.25.5, atomically install and run read-only MCP smoke.
-- Expected evidence: matching remote SHA, clean-source build metadata/checksum, ten tools and read-only space/restriction/dry-run results from installed binary.
-- Stop or replan if: delivery needs overwriting unrelated work, or external acceptance requires unapproved writes.
+- Closes: R6 external acceptance only.
+- Smallest next action: obtain explicit approved test parent/page and test users/groups, then perform the synthetic PNG/JSONL and granular-ACL acceptance sequence; verify rendering in an authorized browser.
+- Expected evidence: duplicate preserves attachment/version, explicit update adds a version, granular assignment preserves others, readback matches and embedded PNG renders.
+- Stop or replan if: destination/subjects are not approved. Do not use the production homepage or real case as a substitute.
 
 ## Current State
-- Resolved: R1/R3/R4/R5 locally; R2 local fixtures passed.
-- Last relevant evidence: GOTOOLCHAIN=go1.25.5 go vet ./...; full go test -race -covermode=atomic ./... passed (coverage artifact outside repo); golangci-lint run ./... passed with zero issues; focused access tests passed after test-only lint fixes; git diff --check clean.
-- Blocker: R6 needs agreed test location/subjects and authorized-browser validation.
-- Next: commit/push/build/install and read-only smoke; do not mark the overall goal complete while R6 remains blocked.
+- Resolved: R1–R5 and R7/R8; implementation is published and installed.
+- Last relevant evidence: full Go 1.25.5 race/vet, zero-issue lint and affected tests passed; implementation diff reviewed; GitHub Release successful; installed read-only smoke passed.
+- Blocker: R6 needs agreed test location/subjects and authorized-browser validation. No authorized write experiment remains; local fixtures and read-only probes cannot prove actual upload/update/rendering behavior.
+- Next: wait for the smallest unlock (approved location and subjects), not further speculative runtime changes. Restart the consuming MCP client/process to pick up the replaced executable.
 
 ## Material Decisions
 - 2026-11-17: user approved implementation, commit/push and replacement of current PATH binary. Existing unrelated .gitignore modification excluded.
@@ -114,6 +114,9 @@ Complete the frozen Required Outcomes using the listed Change Envelope and Prima
 ## Checkpoint History
 - 2026-11-17: frozen original specification and approved plan after successful read-only RECON; external write acceptance explicitly blocked, not waived.
 - 2026-11-17: implemented four tools without dependencies; reviewed runtime/contract diff. Full Go 1.25.5 race tests and vet passed. Existing CI lint found test-only style issues, corrected; lint and affected tests now pass. No private server mutations.
+- 2026-11-17: pushed 94489e0; GitHub Release run 44096841379 succeeded. Built clean published source, atomically replaced existing PATH binary and verified installed read-only space/restriction/dry-run behavior. Only R6 remains blocked by missing authorization for a test location/subjects and visual acceptance.
 
 ## Completion
-- Not complete: implementation/delivery pending and external acceptance requires authorization.
+- Closure comparison: R1–R5/R7/R8 verified; R6 blocked, not waived. Overall status blocked, not complete.
+- Delivery scope remains four tools, necessary safe transport changes, tests and current docs; no dependency/workflow/.env/user .gitignore changes. No Confluence mutations or case publication occurred.
+- Installed runtime is implementation commit 94489e0; this final evidence record does not change runtime source and requires no rebuild.
